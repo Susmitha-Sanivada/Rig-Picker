@@ -1,4 +1,6 @@
 import bpy
+import tempfile
+import os
 
 ARMATURE_NAME = "Sky_Rig"
 
@@ -208,5 +210,95 @@ class RP_OT_Rename(bpy.types.Operator):
     def execute(self, context):
 
         context.scene.rp_items[self.index].label = self.new_name
+
+        return {'FINISHED'}
+
+
+
+
+class RP_OT_CaptureView(bpy.types.Operator):
+
+    bl_idname = "rp.capture_view"
+    bl_label = "Capture View"
+
+    def execute(self, context):
+
+        import os
+        import tempfile
+        import bpy
+
+        image_path = os.path.join(
+            tempfile.gettempdir(),
+            "rig_picker_capture.png"
+        )
+
+        scene = context.scene
+
+        old_filepath = scene.render.filepath
+        scene.render.filepath = image_path
+
+        success = False
+
+        # Find a VIEW_3D and capture it
+        for window in bpy.context.window_manager.windows:
+
+            screen = window.screen
+
+            for area in screen.areas:
+
+                if area.type != 'VIEW_3D':
+                    continue
+
+                for region in area.regions:
+
+                    if region.type != 'WINDOW':
+                        continue
+
+                    with bpy.context.temp_override(
+                        window=window,
+                        area=area,
+                        region=region,
+                    ):
+
+                        bpy.ops.render.opengl(write_still=True)
+
+                    success = True
+                    break
+
+                if success:
+                    break
+
+            if success:
+                break
+
+        scene.render.filepath = old_filepath
+
+        if not success:
+
+            self.report(
+                {'ERROR'},
+                "Could not capture viewport."
+            )
+
+            return {'CANCELLED'}
+
+        # Store the image path
+        scene.rp_background_image = image_path
+
+        self.report(
+            {'INFO'},
+            "Viewport captured."
+        )
+
+        return {'FINISHED'}
+
+class RP_OT_ClearAll(bpy.types.Operator):
+
+    bl_idname = "rp.clear_all"
+    bl_label = "Clear All Controls"
+
+    def execute(self, context):
+
+        context.scene.rp_items.clear()
 
         return {'FINISHED'}

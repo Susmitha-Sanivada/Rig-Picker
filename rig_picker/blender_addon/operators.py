@@ -1,13 +1,6 @@
 import bpy
 import sys
 
-print("=" * 60)
-print(sys.executable)
-print()
-print("Python search paths:")
-for p in sys.path:
-    print(p)
-print("=" * 60)
 
 class RP_OT_OpenPicker(bpy.types.Operator):
     bl_idname = "rigpicker.open"
@@ -19,9 +12,7 @@ class RP_OT_OpenPicker(bpy.types.Operator):
             # Import only when button is clicked
             from .ui.launcher import show_picker
 
-            print("=" * 50)
-            print("Opening Rig Picker...")
-            print("=" * 50)
+            
 
             show_picker()
 

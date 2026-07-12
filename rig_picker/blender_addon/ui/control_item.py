@@ -31,8 +31,6 @@ class ControlItem(QWidget):
         self.rename_btn = QPushButton("✏")
         self.delete_btn = QPushButton("❌")
 
-        self.rename_btn.setFixedWidth(35)
-        self.delete_btn.setFixedWidth(35)
 
         self.rename_btn.setToolTip("Rename")
         self.delete_btn.setToolTip("Remove")

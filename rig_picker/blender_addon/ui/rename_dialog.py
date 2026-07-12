@@ -14,7 +14,6 @@ class RenameDialog(QDialog):
         super().__init__()
 
         self.setWindowTitle("Rename Control")
-        self.setFixedSize(300, 130)
 
         layout = QVBoxLayout(self)
 
