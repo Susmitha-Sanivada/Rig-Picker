@@ -88,14 +88,40 @@ class CircleControl(QWidget):
     
     def mouseMoveEvent(self, event):
 
-        if not self.dragging:
-            return
+        if self.dragging:
 
-        parent_pos = self.parentWidget().mapFromGlobal(
-            event.globalPosition().toPoint()
-        )
+            parent = self.parent()
 
-        self.move(parent_pos - self.drag_offset)
+            parent_pos = parent.mapFromGlobal(
+                event.globalPosition().toPoint()
+            )
+
+            x = parent_pos.x() - self.drag_offset.x()
+            y = parent_pos.y() - self.drag_offset.y()
+
+            # ---------------------------------
+            # Clamp inside parent canvas
+            # ---------------------------------
+
+            x = max(
+                0,
+                min(
+                    x,
+                    parent.width() - self.width()
+                )
+            )
+
+            y = max(
+                0,
+                min(
+                    y,
+                    parent.height() - self.height()
+                )
+            )
+
+            self.move(x, y)
+
+        super().mouseMoveEvent(event)
     
     def mouseReleaseEvent(self, event):
 
