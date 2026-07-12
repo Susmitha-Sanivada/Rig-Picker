@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
 )
 
-from ui.control_item import ControlItem
+from .control_item import ControlItem
 
 
 class ControlList(QScrollArea):

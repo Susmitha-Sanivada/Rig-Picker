@@ -18,9 +18,9 @@ from PySide6.QtWidgets import (
 )
 
 from PySide6.QtCore import Qt
-from ui.control_list import ControlList
-from ui.rename_dialog import RenameDialog
-from ui.controller import Controller
+from .control_list import ControlList
+from .rename_dialog import RenameDialog
+from .controller import Controller
 
 
 class RigPickerWindow(QMainWindow):
@@ -32,25 +32,12 @@ class RigPickerWindow(QMainWindow):
         self.resize(420, 700)
 
         self.controller = Controller()
-
         self.controller.set_window(self)
+
         self.build_ui()
-        for name in [
-            "Torso",
-            "Head",
-            "Left Arm",
-            "Right Arm",
-            "Left Hand",
-            "Right Hand",
-            "Left Leg",
-            "Right Leg",
-        ]:
 
-            self.control_list.add_control(name)
-
-            self.connect_item(
-                self.control_list.controls[name]
-            )
+        self.controller.refresh()
+        
 
     def connect_item(self, item):
 

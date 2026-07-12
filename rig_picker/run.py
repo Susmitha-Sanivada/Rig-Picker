@@ -2,7 +2,7 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
-from ui.main_window import RigPickerWindow
+from rig_picker.ui.main_window import RigPickerWindow
 
 
 def main():
