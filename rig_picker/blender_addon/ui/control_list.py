@@ -143,8 +143,11 @@ class PickerCanvas(QWidget):
 
         if event.button() == Qt.LeftButton:
 
-            self.dragging = True
-            self.drag_start = event.position().toPoint()
+            child = self.childAt(event.position().toPoint())
+
+            if child is None:
+                self.dragging = True
+                self.drag_start = event.position().toPoint()
 
         super().mousePressEvent(event)
 

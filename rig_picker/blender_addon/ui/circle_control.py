@@ -83,6 +83,9 @@ class CircleControl(QWidget):
             self.dragging = True
             self.drag_offset = event.position().toPoint()
 
+            event.accept()
+            return
+
         super().mousePressEvent(event)
 
     
@@ -120,6 +123,8 @@ class CircleControl(QWidget):
             )
 
             self.move(x, y)
+            event.accept()
+            return
 
         super().mouseMoveEvent(event)
     
@@ -131,5 +136,8 @@ class CircleControl(QWidget):
 
             # If mouse barely moved, treat it as a click.
             self.clicked.emit(self.bone_name)
+
+            event.accept()
+            return
 
         super().mouseReleaseEvent(event)

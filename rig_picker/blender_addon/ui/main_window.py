@@ -21,8 +21,8 @@ from .flow_layout import FlowLayout
 
 class RigPickerWindow(QMainWindow):
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
 
         self.setWindowTitle("Rig Picker")
 
