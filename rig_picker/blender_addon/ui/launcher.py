@@ -1,14 +1,10 @@
 """
 launcher.py
 
-Starts the floating Rig Picker window using BQT.
+Creates and shows the Rig Picker window.
 """
 
-from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt
-
-from .main_window import RigPickerWindow
-
+from ..dependency import ensure_qt
 
 _window = None
 
@@ -17,42 +13,25 @@ def show_picker():
 
     global _window
 
-    from PySide6.QtWidgets import QApplication
-    import bl_ext.user_default.bqt as bqt
+    app = ensure_qt()
 
-    app = QApplication.instance()
+    # Import AFTER Qt is ready
+    import shiboken6
+    from .main_window import RigPickerWindow
 
-    if app is None:
+    if (
+        _window is None
+        or not shiboken6.isValid(_window)
+    ):
 
-        # Start BQT manually
-        bqt.register()
-
-        app = QApplication.instance()
-
-    if app is None:
-        raise RuntimeError("Unable to initialize BQT.")
-
-    parent = app.blender_widget
-
-    if _window is None:
-
-        _window = RigPickerWindow(parent)
+        _window = RigPickerWindow(
+            parent=app.blender_widget
+        )
 
         _window.setObjectName("RigPicker")
 
-        _window.setWindowFlag(Qt.Tool, True)
-
-        screen = app.primaryScreen().availableGeometry()
-
-        x = screen.right() - _window.width() - 20
-        y = 80
-
-        _window.move(x, y)
-
     _window.show()
-
     _window.raise_()
-
     _window.activateWindow()
 
     return _window
