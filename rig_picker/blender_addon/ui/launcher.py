@@ -17,12 +17,20 @@ def show_picker():
 
     global _window
 
+    from PySide6.QtWidgets import QApplication
+    import bl_ext.user_default.bqt as bqt
+
     app = QApplication.instance()
 
     if app is None:
-        raise RuntimeError(
-            "BQT is not initialized."
-        )
+
+        # Start BQT manually
+        bqt.register()
+
+        app = QApplication.instance()
+
+    if app is None:
+        raise RuntimeError("Unable to initialize BQT.")
 
     parent = app.blender_widget
 
