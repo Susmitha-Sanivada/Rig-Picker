@@ -13,7 +13,9 @@ def show_picker():
 
     global _window
 
-    app = ensure_qt()
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
 
     # Import AFTER Qt is ready
     import shiboken6

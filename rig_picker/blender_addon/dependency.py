@@ -113,8 +113,10 @@ def install_pyside():
         "-m",
         "pip",
         "install",
-        "PySide6",
         "--upgrade",
+        "PySide6",
+        "blender-qt-stylesheet",
+        "qtpy",
         "--target",
         str(target),
     ])
@@ -128,15 +130,12 @@ def install_pyside():
 
 def has_bqt():
 
-    try:
+    add_python_path()
 
-        import bl_ext.user_default.bqt
-
-        return True
-
-    except Exception:
-
-        return False
+    return (
+        importlib.util.find_spec("bqt")
+        is not None
+    )
 
 
 # ----------------------------------------------------------
@@ -153,7 +152,7 @@ def initialize_bqt():
     if app is not None:
         return app
 
-    import bl_ext.user_default.bqt as bqt
+    import bqt
 
     bqt.register()
 
@@ -202,28 +201,34 @@ def bqt_zip():
 
     return vendor_folder() / "bqt.zip"
 
+import zipfile
+import shutil
+
+
+def bqt_folder():
+
+    return python_folder() / "bqt"
+
+
 def install_bqt():
 
-    zip_path = bqt_zip()
+    target = bqt_folder()
 
-    if not zip_path.exists():
+    if target.exists():
+        return
 
-        raise RuntimeError(
-            f"BQT archive not found:\n{zip_path}"
+    print("=" * 60)
+    print("Extracting bundled BQT")
+    print("=" * 60)
+
+    with zipfile.ZipFile(
+        bqt_zip(),
+        "r",
+    ) as z:
+
+        z.extractall(
+            python_folder()
         )
-
-    result = bpy.ops.extensions.package_install_files(
-        repo=get_local_repo(),
-
-        filepath=str(zip_path),
-
-        enable_on_install=True,
-
-        overwrite=False,
-
-    )
-
-    print(result)
 
 
 def python_folder():
@@ -249,14 +254,3 @@ def add_python_path():
             folder,
         )
 
-def get_local_repo():
-
-    prefs = bpy.context.preferences
-
-    for repo in prefs.extensions.repos:
-
-        # We want a writable local repository
-        if not repo.remote_url:
-            return repo.module
-
-    raise RuntimeError("No writable extension repository found.")

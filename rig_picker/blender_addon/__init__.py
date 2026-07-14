@@ -3,7 +3,8 @@ bl_info = {
     "author": "Susmitha",
     "version": (1, 0, 0),
     "blender": (4, 3, 0),
-    "location": "View3D > Sidebar > Rig Picker",
+    "location": "View3D",
+    "description": "Floating Rig Picker",
     "category": "Animation",
 }
 
@@ -43,10 +44,15 @@ classes = (
 )
 
 
+from .dependency import ensure_qt
+
+
 def register():
 
     for cls in classes:
         bpy.utils.register_class(cls)
+
+    ensure_qt()
 
     bpy.types.Scene.rp_items = bpy.props.CollectionProperty(
         type=RP_Item
