@@ -32,7 +32,7 @@ class ControlList(QScrollArea):
 
     # -----------------------------------------------------
 
-    def add_control(self, bone_name):
+    def add_control(self, bone_name, x=None, y=None):
 
         if bone_name in self.controls:
             return
@@ -42,17 +42,18 @@ class ControlList(QScrollArea):
         # Make the canvas the parent
         control.setParent(self.container)
 
-        # Initial position
-        index = len(self.controls)
+        if x is None or y is None:
 
-        x = 30 + (index % 8) * 35
-        y = 30 + (index // 8) * 35
+            index = len(self.controls)
 
-        control.move(x, y)
+            x = 30 + (index % 8) * 35
+            y = 30 + (index // 8) * 35
 
-        control.show()
+        control.move(int(x), int(y))
 
         self.controls[bone_name] = control
+
+        return control
 
     # -----------------------------------------------------
 

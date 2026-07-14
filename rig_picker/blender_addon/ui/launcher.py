@@ -32,6 +32,18 @@ def show_picker():
 
         _window.setObjectName("RigPicker")
 
+         # -----------------------------
+        # Position relative to Blender
+        # -----------------------------
+        _window.adjustSize()
+
+        blender_rect = app.blender_widget.frameGeometry()
+
+        x = blender_rect.right() - _window.width() - 10
+        y = blender_rect.top() + 30
+
+        _window.move(x, y)
+
     _window.show()
     _window.raise_()
     _window.activateWindow()

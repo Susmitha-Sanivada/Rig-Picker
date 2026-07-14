@@ -26,12 +26,24 @@ class Controller:
         if self.window is None:
             return
 
+        scene = bpy.context.scene
+
         self.window.control_list.clear_controls()
 
-        for item in bpy.context.scene.rp_items:
+        if scene.rp_background_image:
+
+            self.window.control_list.set_background(
+                scene.rp_background_image
+            )
+        for item in scene.rp_items:
+
+            x = None if item.x < 0 else item.x
+            y = None if item.y < 0 else item.y
 
             self.window.control_list.add_control(
-                item.bone_name
+                item.bone_name,
+                x,
+                y,
             )
 
             widget = self.window.control_list.controls[

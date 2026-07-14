@@ -123,6 +123,17 @@ class CircleControl(QWidget):
             )
 
             self.move(x, y)
+            import bpy
+
+            for item in bpy.context.scene.rp_items:
+
+                if item.bone_name == self.bone_name:
+
+                    item.x = x
+
+                    item.y = y
+
+                    break
             event.accept()
             return
 

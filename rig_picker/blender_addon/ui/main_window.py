@@ -25,6 +25,8 @@ class RigPickerWindow(QMainWindow):
         super().__init__(parent)
 
         self.setWindowTitle("Rig Picker")
+        self.resize(360, 500)
+        self.setMinimumSize(360, 500)
 
         self.controller = Controller()
         self.controller.set_window(self)

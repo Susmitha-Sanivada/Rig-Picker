@@ -10,8 +10,18 @@ ARMATURE_NAME = "Sky_Rig"
 # ---------------------------------------------------------
 
 class RP_Item(bpy.types.PropertyGroup):
+
     bone_name: bpy.props.StringProperty()
+
     label: bpy.props.StringProperty()
+
+    x: bpy.props.FloatProperty(
+        default=-1.0,
+    )
+
+    y: bpy.props.FloatProperty(
+        default=-1.0,
+    )
 
 
 # ---------------------------------------------------------
@@ -69,6 +79,10 @@ class RP_OT_Add(bpy.types.Operator):
 
             item.bone_name = pb.name
             item.label = pb.name
+
+            item.x = -1
+
+            item.y = -1
         
 
         return {'FINISHED'}
