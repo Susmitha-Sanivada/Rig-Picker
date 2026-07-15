@@ -5,26 +5,34 @@ Simple circular picker control.
 """
 
 from PySide6.QtCore import Qt, QPoint, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QBrush
+from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QPolygon
 from PySide6.QtWidgets import QWidget
 
 
 class CircleControl(QWidget):
 
     clicked = Signal(str)
+    COLORS = {
+        "RED": QColor(220, 70, 70),
+        "GREEN": QColor(104, 161, 109),
+        "BLUE": QColor(65, 140, 230),
+        "YELLOW": QColor(230, 195, 55),
+    }
 
-    def __init__(self, bone_name, radius=10, color=None):
+    def __init__(self, bone_name, size=36, shape="CIRCLE", color="GREEN"):
 
         super().__init__()
 
         self.bone_name = bone_name
 
-        self.radius = radius
+        self.size = size
+        self.shape = shape
+        self.color_name = color
         self.display_scale = 1.0
 
-        self.color = color or QColor(60, 200, 80)
+        self.color = self.COLORS.get(color, self.COLORS["GREEN"])
 
-        self.setFixedSize(radius * 2 + 4, radius * 2 + 4)
+        self.setFixedSize(size, size)
 
         self.setCursor(Qt.PointingHandCursor)
 
@@ -37,8 +45,22 @@ class CircleControl(QWidget):
     def set_display_scale(self, scale):
         """Resize the hit area and drawing with the background image."""
         self.display_scale = max(0.1, scale)
-        diameter = max(8, round((self.radius * 2 + 4) * self.display_scale))
-        self.setFixedSize(diameter, diameter)
+        height = max(8, round(self.size * self.display_scale))
+        width = height
+        if self.shape == "RECTANGLE":
+            width = max(12, round(height * 1.6))
+        self.setFixedSize(width, height)
+
+    def set_appearance(self, size=None, shape=None, color=None):
+        if size is not None:
+            self.size = size
+        if shape is not None:
+            self.shape = shape
+        if color is not None:
+            self.color_name = color
+            self.color = self.COLORS.get(color, self.COLORS["GREEN"])
+        self.set_display_scale(self.display_scale)
+        self.update()
 
     # -----------------------------------------------------
 
@@ -54,13 +76,22 @@ class CircleControl(QWidget):
         color = QColor(self.color)
 
         if self.hover:
-            color = color.lighter(130)
+            color = QColor(140, 200, 145)
 
         painter.setBrush(QBrush(color))
 
         painter.setPen(QPen(Qt.white, max(1, round(2 * self.display_scale))))
 
-        painter.drawEllipse(rect)
+        if self.shape == "RECTANGLE":
+            painter.drawRect(rect)
+        elif self.shape == "TRIANGLE":
+            painter.drawPolygon(QPolygon([
+                rect.center() + QPoint(0, -rect.height() // 2),
+                rect.bottomLeft(),
+                rect.bottomRight(),
+            ]))
+        else:
+            painter.drawEllipse(rect)
 
     # -----------------------------------------------------
 

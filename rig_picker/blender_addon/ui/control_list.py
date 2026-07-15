@@ -32,12 +32,12 @@ class ControlList(QScrollArea):
 
     # -----------------------------------------------------
 
-    def add_control(self, bone_name, x=None, y=None):
+    def add_control(self, bone_name, x=None, y=None, size=36, shape="CIRCLE", color="GREEN"):
 
         if bone_name in self.controls:
             return
 
-        control = CircleControl(bone_name, radius=18)
+        control = CircleControl(bone_name, size=size, shape=shape, color=color)
 
         # Make the canvas the parent
         control.setParent(self.container)

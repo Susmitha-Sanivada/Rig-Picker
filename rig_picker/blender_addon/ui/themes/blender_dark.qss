@@ -1,0 +1,274 @@
+/*--------------------------------------------------
+    Blender 4.x Dark Theme
+--------------------------------------------------*/
+
+QWidget
+{
+    background: #2f2f2f;
+    color: #d7d7d7;
+    font-family: "Segoe UI";
+    font-size: 9pt;
+}
+
+/*--------------------------------------------------
+    Blender Button
+--------------------------------------------------*/
+
+QPushButton
+{
+    background-color: #3f3f3f;
+    border: 1px solid #5b5b5b;
+
+    border-radius: 4px;
+
+    padding: 1px 6px;
+
+    min-height: 18px;
+    max-height: 20px;
+
+    color: #d8d8d8;
+}
+
+QPushButton:hover
+{
+    background-color: #4b4b4b;
+    border: 1px solid #6f6f6f;
+}
+
+QPushButton:pressed
+{
+    background-color: #2f2f2f;
+    border: 1px solid #7c7c7c;
+}
+
+QPushButton:disabled
+{
+    background-color: #353535;
+    color: #777777;
+}
+
+/*--------------------------------------------------
+    Line Edit
+--------------------------------------------------*/
+
+QLineEdit
+{
+    background: #383838;
+    border: 1px solid #555555;
+    border-radius: 4px;
+    padding: 4px;
+    selection-background-color: #4c8bf5;
+}
+
+/*--------------------------------------------------
+    Blender ComboBox
+--------------------------------------------------*/
+
+QComboBox
+{
+    background-color: #292929;
+    border: 1px solid #5b5b5b;
+    border-radius: 2px;
+
+    padding-left: 6px;
+    padding-right: 22px;
+
+    min-height: 18px;
+    max-height: 20px;
+
+    color: #d8d8d8;
+}
+
+QComboBox:hover
+{
+    background-color: #464646;
+    border: 1px solid #7a7a7a;
+}
+
+QComboBox:pressed
+{
+    background-color: #353535;
+}
+
+QComboBox::drop-down
+{
+    width:18px;
+
+    border:none;
+
+    background-color:#4a4a4a;
+
+    border-left:1px solid #5f5f5f;
+}
+
+QComboBox::drop-down:hover
+{
+    background-color:#555555;
+}
+
+QComboBox::down-arrow
+{
+    image:none;
+
+    width:0px;
+    height:0px;
+}
+
+QComboBox::down-arrow
+{
+    image: url(:/icons/down_arrow.svg);
+
+    width:8px;
+    height:8px;
+}
+
+
+
+/*--------------------------------------------------
+    List Widget
+--------------------------------------------------*/
+
+QListWidget
+{
+    background: #353535;
+    border: 1px solid #4d4d4d;
+}
+
+QListWidget::item
+{
+    padding: 4px;
+}
+
+QListWidget::item:hover
+{
+    background: #505050;
+}
+
+QListWidget::item:selected
+{
+    background: #4f86f7;
+}
+
+/*--------------------------------------------------
+    Scrollbars
+--------------------------------------------------*/
+
+QScrollBar:vertical
+{
+    background: #323232;
+    width: 12px;
+    margin: 0px;
+}
+
+QScrollBar::handle:vertical
+{
+    background: #5f5f5f;
+    min-height: 30px;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:vertical:hover
+{
+    background: #7a7a7a;
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical
+{
+    height: 0px;
+}
+
+QScrollBar:horizontal
+{
+    background: #323232;
+    height: 12px;
+}
+
+QScrollBar::handle:horizontal
+{
+    background: #5f5f5f;
+    min-width: 30px;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:horizontal:hover
+{
+    background: #7a7a7a;
+}
+
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal
+{
+    width: 0px;
+}
+
+/*--------------------------------------------------
+    Group Box
+--------------------------------------------------*/
+
+QGroupBox
+{
+    border: 1px solid #555555;
+    border-radius: 5px;
+    margin-top: 8px;
+    padding-top: 8px;
+}
+
+QGroupBox::title
+{
+    left: 8px;
+    padding: 0px 4px;
+}
+
+/*--------------------------------------------------
+    Tooltip
+--------------------------------------------------*/
+
+QToolTip
+{
+    background: #454545;
+    color: white;
+    border: 1px solid #777777;
+}
+
+QAbstractItemView
+{
+    background:#353535;
+
+    border:1px solid #5b5b5b;
+
+    selection-background-color:#5c88ff;
+
+    selection-color:white;
+
+    outline:0;
+
+    padding:2px;
+}
+
+QAbstractItemView::item
+{
+    height:18px;
+
+    padding-left:6px;
+}
+
+QAbstractItemView::item:hover
+{
+    background:#4f4f4f;
+}
+
+QAbstractItemView::item:selected
+{
+    background:#5d8cff;
+}
+
+QAbstractItemView QScrollBar:vertical
+{
+    width:10px;
+}
+
+QComboBox:focus
+{
+    outline:none;
+}

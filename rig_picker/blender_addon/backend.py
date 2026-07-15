@@ -23,6 +23,10 @@ class RP_Item(bpy.types.PropertyGroup):
         default=-1.0,
     )
 
+    control_size: bpy.props.IntProperty(default=36)
+    control_shape: bpy.props.StringProperty(default="CIRCLE")
+    control_color: bpy.props.StringProperty(default="GREEN")
+
 
 # ---------------------------------------------------------
 # HELPERS
