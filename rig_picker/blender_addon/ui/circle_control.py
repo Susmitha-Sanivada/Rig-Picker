@@ -4,7 +4,7 @@ circle_control.py
 Simple circular picker control.
 """
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QPoint, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QBrush
 from PySide6.QtWidgets import QWidget
 
@@ -20,6 +20,7 @@ class CircleControl(QWidget):
         self.bone_name = bone_name
 
         self.radius = radius
+        self.display_scale = 1.0
 
         self.color = color or QColor(60, 200, 80)
 
@@ -33,6 +34,12 @@ class CircleControl(QWidget):
 
         self.drag_offset = None
 
+    def set_display_scale(self, scale):
+        """Resize the hit area and drawing with the background image."""
+        self.display_scale = max(0.1, scale)
+        diameter = max(8, round((self.radius * 2 + 4) * self.display_scale))
+        self.setFixedSize(diameter, diameter)
+
     # -----------------------------------------------------
 
     def paintEvent(self, event):
@@ -41,7 +48,8 @@ class CircleControl(QWidget):
 
         painter.setRenderHint(QPainter.Antialiasing)
 
-        rect = self.rect().adjusted(4, 4, -4, -4)
+        margin = max(1, round(4 * self.display_scale))
+        rect = self.rect().adjusted(margin, margin, -margin, -margin)
 
         color = QColor(self.color)
 
@@ -50,7 +58,7 @@ class CircleControl(QWidget):
 
         painter.setBrush(QBrush(color))
 
-        painter.setPen(QPen(Qt.white, 2))
+        painter.setPen(QPen(Qt.white, max(1, round(2 * self.display_scale))))
 
         painter.drawEllipse(rect)
 
@@ -122,18 +130,7 @@ class CircleControl(QWidget):
                 )
             )
 
-            self.move(x, y)
-            import bpy
-
-            for item in bpy.context.scene.rp_items:
-
-                if item.bone_name == self.bone_name:
-
-                    item.x = x
-
-                    item.y = y
-
-                    break
+            parent.move_control_from_canvas(self, QPoint(x, y))
             event.accept()
             return
 

@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
 
 from .circle_control import CircleControl
 from PySide6.QtGui import QPixmap, QPainter,QImage
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QPoint
 
 
 class ControlList(QScrollArea):
@@ -37,7 +37,7 @@ class ControlList(QScrollArea):
         if bone_name in self.controls:
             return
 
-        control = CircleControl(bone_name, radius=10)
+        control = CircleControl(bone_name, radius=18)
 
         # Make the canvas the parent
         control.setParent(self.container)
@@ -49,9 +49,13 @@ class ControlList(QScrollArea):
             x = 30 + (index % 8) * 35
             y = 30 + (index // 8) * 35
 
-        control.move(int(x), int(y))
+        # Positions saved in Blender are in the unscaled background image's
+        # coordinate space, not the current canvas's pixel space.
+        control.image_position = QPoint(int(x), int(y))
 
         self.controls[bone_name] = control
+        self.container.layout_controls()
+        control.show()
 
         return control
 
@@ -98,6 +102,7 @@ class ControlList(QScrollArea):
         self.container.image_offset_x = 0.0
         self.container.image_offset_y = 0.0
 
+        self.container.layout_controls()
         self.container.update()
 
 class PickerCanvas(QWidget):
@@ -119,6 +124,58 @@ class PickerCanvas(QWidget):
         self.dragging = False
         self.drag_start = None
 
+    def scaled_background(self):
+        if self.background is None:
+            return None
+
+        return self.background.scaled(
+            self.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+
+    def image_scale(self):
+        pixmap = self.scaled_background()
+        if pixmap is None or self.background.width() == 0:
+            return 1.0
+
+        return pixmap.width() / self.background.width()
+
+    def canvas_to_image_position(self, position):
+        """Convert a canvas point to the unscaled background image space."""
+        scale = self.image_scale()
+        return QPoint(
+            round((position.x() - self.image_x) / scale),
+            round((position.y() - self.image_y) / scale),
+        )
+
+    def layout_controls(self):
+        """Apply the current image transform to every picker control."""
+        scale = self.image_scale()
+
+        for control in self.findChildren(CircleControl):
+            if not hasattr(control, "image_position"):
+                control.image_position = self.canvas_to_image_position(control.pos())
+
+            control.set_display_scale(scale)
+            control.move(
+                round(self.image_x + control.image_position.x() * scale),
+                round(self.image_y + control.image_position.y() * scale),
+            )
+
+    def move_control_from_canvas(self, control, position):
+        """Move a control from a drag and persist its image-relative position."""
+        control.image_position = self.canvas_to_image_position(position)
+        self.layout_controls()
+
+        import bpy
+
+        for item in bpy.context.scene.rp_items:
+            if item.bone_name == control.bone_name:
+                item.x = control.image_position.x()
+                item.y = control.image_position.y()
+                break
+
     def paintEvent(self, event):
 
         super().paintEvent(event)
@@ -128,11 +185,7 @@ class PickerCanvas(QWidget):
 
         painter = QPainter(self)
 
-        pixmap = self.background.scaled(
-            self.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
+        pixmap = self.scaled_background()
 
         painter.drawPixmap(
             self.image_x,
@@ -217,6 +270,7 @@ class PickerCanvas(QWidget):
                 self.image_offset_x = (self.image_x - min_x) / available_x
                 self.image_offset_y = (self.image_y - min_y) / available_y
 
+            self.layout_controls()
             self.update()
 
         super().mouseMoveEvent(event)
@@ -271,4 +325,5 @@ class PickerCanvas(QWidget):
             min_y + self.image_offset_y * available_y
         )
 
+        self.layout_controls()
         self.update()
