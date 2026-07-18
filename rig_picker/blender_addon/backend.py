@@ -104,6 +104,10 @@ class RP_OT_Select(bpy.types.Operator):
 
     bone_name: bpy.props.StringProperty()
 
+    shift: bpy.props.BoolProperty(
+        default=False
+    )
+
     def execute(self, context):
 
         rig = arm()
@@ -113,11 +117,10 @@ class RP_OT_Select(bpy.types.Operator):
 
         ensure_pose(context, rig)
 
-        for bone in rig.data.bones:
-
-            bone.hide = True
-
-            bone.select = False
+        if not self.shift:
+            for bone in rig.data.bones:
+                bone.hide = True
+                bone.select = False
 
         bone = rig.data.bones.get(self.bone_name)
 
@@ -125,7 +128,11 @@ class RP_OT_Select(bpy.types.Operator):
 
             bone.hide = False
 
-            bone.select = True
+            if self.shift:
+                # Toggle selection
+                bone.select = not bone.select
+            else:
+                bone.select = True
 
             rig.data.bones.active = bone
 

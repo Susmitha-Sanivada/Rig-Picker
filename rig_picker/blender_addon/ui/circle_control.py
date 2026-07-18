@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QWidget
 
 class CircleControl(QWidget):
 
-    clicked = Signal(str)
+    clicked = Signal(str, bool)
     COLORS = {
         "RED": QColor(220, 70, 70),
         "GREEN": QColor(104, 161, 109),
@@ -203,8 +203,8 @@ class CircleControl(QWidget):
 
             self.dragging = False
 
-            # If mouse barely moved, treat it as a click.
-            self.clicked.emit(self.bone_name)
+            shift = bool(event.modifiers() & Qt.ShiftModifier)
+            self.clicked.emit(self.bone_name, shift)
 
             event.accept()
             return

@@ -12,7 +12,8 @@ class Controller:
     def __init__(self):
 
         self.window = None
-        self.selected_bone_name = None
+        # self.selected_bone_name = None
+        self.selected_bones = set()
         self.active = False
 
     # ---------------------------------------------------------
@@ -67,22 +68,20 @@ class Controller:
 
     # ---------------------------------------------------------
 
-    def select_control(self, bone_name):
+    def select_control(self, bone_name, shift=False):
 
-        self.selected_bone_name = bone_name
+        if shift:
+            if bone_name in self.selected_bones:
+                self.selected_bones.remove(bone_name)
+            else:
+                self.selected_bones.add(bone_name)
+        else:
+            self.selected_bones = {bone_name}
 
-        # ----------------------------------------
-        # Update active control
-        # ----------------------------------------
-
-        for widget in self.window.control_list.controls.values():
-            widget.active = False
+        for name, widget in self.window.control_list.controls.items():
+            widget.active = (name in self.selected_bones)
             widget.update()
 
-        widget = self.window.control_list.controls.get(bone_name)
-        if widget:
-            widget.active = True
-            widget.update()
 
         # ----------------------------------------
 
@@ -100,7 +99,8 @@ class Controller:
             )
 
         bpy.ops.rp.select(
-            bone_name=bone_name
+            bone_name=bone_name,
+            shift=shift
         )
 
     def set_selected_size(self, size):
@@ -113,11 +113,11 @@ class Controller:
         self._set_selected_appearance(color=color)
 
     def _set_selected_appearance(self, size=None, shape=None, color=None):
-        if not self.selected_bone_name:
+        if not self.selected_bones:
             return
 
         for item in bpy.context.scene.rp_items:
-            if item.bone_name != self.selected_bone_name:
+            if item.bone_name not in self.selected_bones:
                 continue
             if size is not None:
                 item.control_size = size
@@ -130,7 +130,7 @@ class Controller:
             if widget:
                 widget.set_appearance(size=size, shape=shape, color=color)
                 self.window.control_list.container.layout_controls()
-            break
+           
 
     # ---------------------------------------------------------
 
