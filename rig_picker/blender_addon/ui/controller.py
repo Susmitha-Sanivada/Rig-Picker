@@ -161,3 +161,23 @@ class Controller:
         bpy.ops.rp.clear_all()
 
         self.refresh()
+    
+    def delete_selected(self):
+
+        if not self.selected_bones:
+            return
+
+        selected = list(self.selected_bones)
+
+        for bone in selected:
+            bpy.ops.rp.remove_by_name(
+                bone_name=bone
+            )
+
+        self.selected_bones.clear()
+
+        self.window.size_combo.setEnabled(False)
+        self.window.shape_combo.setEnabled(False)
+        self.window.color_combo.setEnabled(False)
+
+        self.refresh()

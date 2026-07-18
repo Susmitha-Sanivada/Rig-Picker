@@ -327,3 +327,20 @@ class RP_OT_ClearAll(bpy.types.Operator):
         context.scene.rp_items.clear()
 
         return {'FINISHED'}
+
+class RP_OT_RemoveByName(bpy.types.Operator):
+
+    bl_idname = "rp.remove_by_name"
+    bl_label = "Remove Control"
+    bone_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+
+        items = context.scene.rp_items
+
+        for i in reversed(range(len(items))):
+            if items[i].bone_name == self.bone_name:
+                items.remove(i)
+                break
+
+        return {'FINISHED'}

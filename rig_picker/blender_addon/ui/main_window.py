@@ -105,6 +105,7 @@ class RigPickerWindow(QMainWindow):
         self.clear_button = QPushButton("Clear All")
         self.show_button = QPushButton("Show All")
         self.hide_button = QPushButton("Hide All")
+        self.delete_button = QPushButton("Delete")
         self.size_combo = PickerComboBox()
         self.size_combo.setObjectName("pickerCombo")
         self.size_combo.addItems([
@@ -137,6 +138,7 @@ class RigPickerWindow(QMainWindow):
         toolbar.addWidget(self.clear_button)
         toolbar.addWidget(self.show_button)
         toolbar.addWidget(self.hide_button)
+        toolbar.addWidget(self.delete_button)
 
         layout.addLayout(toolbar)
 
@@ -219,8 +221,8 @@ class RigPickerWindow(QMainWindow):
             }
         """
         self.size_combo.setFixedWidth(74)
-        self.shape_combo.setFixedWidth(112)
-        self.color_combo.setFixedWidth(86)
+        self.shape_combo.setFixedWidth(100)
+        self.color_combo.setFixedWidth(84)
         self.size_combo.setFixedHeight(24)
         self.shape_combo.setFixedHeight(24)
         self.color_combo.setFixedHeight(24)
@@ -258,6 +260,9 @@ class RigPickerWindow(QMainWindow):
 
         self.hide_button.clicked.connect(
             self.controller.hide_all
+        )
+        self.delete_button.clicked.connect(
+            self.controller.delete_selected
         )
         self.size_combo.currentTextChanged.connect(
             lambda text: self.controller.set_selected_size(int(text.split()[0]))

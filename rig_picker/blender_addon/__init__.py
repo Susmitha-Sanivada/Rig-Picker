@@ -24,6 +24,7 @@ from .backend import (
     RP_OT_HideAll,
     RP_OT_Remove,
     RP_OT_Rename,
+    RP_OT_RemoveByName,
     RP_OT_CaptureView
 )
 
@@ -39,6 +40,7 @@ classes = (
     RP_OT_HideAll,
     RP_OT_Remove,
     RP_OT_Rename,
+    RP_OT_RemoveByName,
     RP_OT_CaptureView,
     RP_PT_MainPanel,
 )
