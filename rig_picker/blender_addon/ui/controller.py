@@ -13,6 +13,7 @@ class Controller:
 
         self.window = None
         self.selected_bone_name = None
+        self.active = False
 
     # ---------------------------------------------------------
 
@@ -69,11 +70,33 @@ class Controller:
     def select_control(self, bone_name):
 
         self.selected_bone_name = bone_name
-        item = next((item for item in bpy.context.scene.rp_items
-                     if item.bone_name == bone_name), None)
+
+        # ----------------------------------------
+        # Update active control
+        # ----------------------------------------
+
+        for widget in self.window.control_list.controls.values():
+            widget.active = False
+            widget.update()
+
+        widget = self.window.control_list.controls.get(bone_name)
+        if widget:
+            widget.active = True
+            widget.update()
+
+        # ----------------------------------------
+
+        item = next(
+            (item for item in bpy.context.scene.rp_items
+            if item.bone_name == bone_name),
+            None
+        )
+
         if item:
             self.window.set_selected_control(
-                item.control_size, item.control_shape, item.control_color
+                item.control_size,
+                item.control_shape,
+                item.control_color,
             )
 
         bpy.ops.rp.select(

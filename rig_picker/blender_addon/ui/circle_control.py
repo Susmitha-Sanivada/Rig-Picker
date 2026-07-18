@@ -42,6 +42,8 @@ class CircleControl(QWidget):
 
         self.drag_offset = None
 
+        self.active = False
+
     def set_display_scale(self, scale):
         """Resize the hit area and drawing with the background image."""
         self.display_scale = max(0.1, scale)
@@ -67,7 +69,6 @@ class CircleControl(QWidget):
     def paintEvent(self, event):
 
         painter = QPainter(self)
-
         painter.setRenderHint(QPainter.Antialiasing)
 
         margin = max(1, round(4 * self.display_scale))
@@ -75,22 +76,51 @@ class CircleControl(QWidget):
 
         color = QColor(self.color)
 
-        if self.hover:
-            color = QColor(140, 200, 145)
+        # -------------------------------
+        # Visual states
+        # -------------------------------
+
+        if self.dragging:
+            color = color.darker(130)                 # shrink slightly when pressed
+
+        elif self.hover:
+            color = color.darker(130)
+
+        # -------------------------------
+        # Fill
+        # -------------------------------
 
         painter.setBrush(QBrush(color))
 
-        painter.setPen(QPen(Qt.white, max(1, round(2 * self.display_scale))))
+        # -------------------------------
+        # Border
+        # -------------------------------
+
+        if self.active:
+            pen = QPen(
+                QColor(20, 20, 20),              # Nearly black
+                max(1, round(1 * self.display_scale))
+            )
+            pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(pen)
+        else:
+            painter.setPen(Qt.NoPen)
 
         if self.shape == "RECTANGLE":
-            painter.drawRect(rect)
+            painter.drawRoundedRect(rect, 4, 4)
+
+        elif self.shape == "SQUARE":
+            painter.drawRoundedRect(rect, 3, 3)
+
         elif self.shape == "TRIANGLE":
-            painter.drawPolygon(QPolygon([
+            triangle = QPolygon([
                 rect.center() + QPoint(0, -rect.height() // 2),
                 rect.bottomLeft(),
                 rect.bottomRight(),
-            ]))
-        else:
+            ])
+            painter.drawPolygon(triangle)
+
+        else:  # CIRCLE
             painter.drawEllipse(rect)
 
     # -----------------------------------------------------

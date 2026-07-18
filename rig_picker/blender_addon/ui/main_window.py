@@ -115,6 +115,7 @@ class RigPickerWindow(QMainWindow):
         self.shape_combo.addItem("Circle", "CIRCLE")
         self.shape_combo.addItem("Rectangle", "RECTANGLE")
         self.shape_combo.addItem("Triangle", "TRIANGLE")
+        self.shape_combo.addItem("Square", "SQUARE")
         self.color_combo = PickerComboBox()
         self.color_combo.setObjectName("pickerCombo")
         self.color_combo.addItem("Red", "RED")
