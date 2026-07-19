@@ -197,11 +197,49 @@ class PickerCanvas(QWidget):
 
         if event.button() == Qt.LeftButton:
 
-            child = self.childAt(event.position().toPoint())
+            click_pos = event.position().toPoint()
 
+            child = self.childAt(click_pos)
+
+            # -----------------------------------------
+            # Nothing directly clicked?
+            # Look for a nearby control.
+            # -----------------------------------------
             if child is None:
+
+                PICK_RADIUS = 10
+
+                nearest = None
+                nearest_dist2 = PICK_RADIUS * PICK_RADIUS
+
+                for control in self.findChildren(CircleControl):
+
+                    center = control.geometry().center()
+
+                    dx = center.x() - click_pos.x()
+                    dy = center.y() - click_pos.y()
+
+                    dist2 = dx * dx + dy * dy
+
+                    if dist2 <= nearest_dist2:
+                        nearest = control
+                        nearest_dist2 = dist2
+
+                # Click close enough to a control
+                if nearest:
+                    nearest.clicked.emit(
+                        nearest.bone_name,
+                        False
+                    )
+                    return
+
+                # Truly empty space
+                window = self.window()
+                if hasattr(window, "controller"):
+                    window.controller.deselect_all()
+
                 self.dragging = True
-                self.drag_start = event.position().toPoint()
+                self.drag_start = click_pos
 
         super().mousePressEvent(event)
 

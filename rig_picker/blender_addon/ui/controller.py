@@ -181,3 +181,63 @@ class Controller:
         self.window.color_combo.setEnabled(False)
 
         self.refresh()
+
+    def select_all(self):
+
+        self.selected_bones = set(
+            self.window.control_list.controls.keys()
+        )
+
+        # Update UI
+        for name, widget in self.window.control_list.controls.items():
+            widget.active = True
+            widget.update()
+
+        # Select every bone in Blender
+        rig = bpy.data.objects.get("Sky_Rig")
+        if rig:
+            for bone in rig.data.bones:
+                bone.hide = False
+                bone.select = False
+
+            for bone_name in self.selected_bones:
+                bone = rig.data.bones.get(bone_name)
+                if bone:
+                    bone.hide = False
+                    bone.select = True
+
+        # Update appearance controls
+        if self.selected_bones:
+            first = next(iter(self.selected_bones))
+            item = next(
+                (
+                    item for item in bpy.context.scene.rp_items
+                    if item.bone_name == first
+                ),
+                None,
+            )
+
+            if item:
+                self.window.set_selected_control(
+                    item.control_size,
+                    item.control_shape,
+                    item.control_color,
+                )
+    
+    def deselect_all(self):
+
+        self.selected_bones.clear()
+
+        for widget in self.window.control_list.controls.values():
+            widget.active = False
+            widget.update()
+
+        self.window.size_combo.setEnabled(False)
+        self.window.shape_combo.setEnabled(False)
+        self.window.color_combo.setEnabled(False)
+
+        # Deselect bones in Blender
+        rig = bpy.data.objects.get("Sky_Rig")
+        if rig:
+            for bone in rig.data.bones:
+                bone.select = False

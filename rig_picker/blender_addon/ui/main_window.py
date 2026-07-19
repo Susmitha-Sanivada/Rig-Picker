@@ -82,6 +82,9 @@ class RigPickerWindow(QMainWindow):
         # Load existing controls from Blender
         self.controller.refresh()
 
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setFocus()
+
     # --------------------------------------------------------
 
     def build_ui(self):
@@ -314,3 +317,27 @@ class RigPickerWindow(QMainWindow):
             self.color_combo.blockSignals(True)
             self.color_combo.setCurrentIndex(color_index)
             self.color_combo.blockSignals(False)
+
+    def keyPressEvent(self, event):
+
+        if event.key() == Qt.Key_A:
+            self.controller.select_all()
+            event.accept()
+            return
+
+        super().keyPressEvent(event)
+
+    def enterEvent(self, event):
+
+        self.activateWindow()
+        self.raise_()
+        self.setFocus(Qt.ActiveWindowFocusReason)
+
+        super().enterEvent(event)
+
+
+    def leaveEvent(self, event):
+
+        self.clearFocus()
+
+        super().leaveEvent(event)
