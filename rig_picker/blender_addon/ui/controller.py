@@ -241,3 +241,5 @@ class Controller:
         if rig:
             for bone in rig.data.bones:
                 bone.select = False
+                bone.hide = True
+            rig.data.bones.active = None
