@@ -2,7 +2,7 @@ import bpy
 import tempfile
 import os
 
-ARMATURE_NAME = "Sky_Rig"
+CURRENT_ARMATURE = None
 
 
 # ---------------------------------------------------------
@@ -32,8 +32,16 @@ class RP_Item(bpy.types.PropertyGroup):
 # HELPERS
 # ---------------------------------------------------------
 
+
+def set_armature(rig):
+    global CURRENT_ARMATURE
+    CURRENT_ARMATURE = rig.name
+
+
 def arm():
-    return bpy.data.objects.get(ARMATURE_NAME)
+    if CURRENT_ARMATURE is None:
+        return None
+    return bpy.data.objects.get(CURRENT_ARMATURE)
 
 
 def ensure_pose(context, rig):
@@ -73,7 +81,7 @@ class RP_OT_Add(bpy.types.Operator):
         # Read selection directly from the rig
         for pb in rig.pose.bones:
 
-            if not pb.bone.select:
+            if not pb.select:
                 continue
 
             if pb.name in existing:
@@ -118,23 +126,22 @@ class RP_OT_Select(bpy.types.Operator):
         ensure_pose(context, rig)
 
         if not self.shift:
-            for bone in rig.data.bones:
-                bone.hide = True
-                bone.select = False
+            for pb in rig.pose.bones:
+                pb.bone.hide = True
+                pb.select = False
 
-        bone = rig.data.bones.get(self.bone_name)
+        pb = rig.pose.bones.get(self.bone_name)
 
-        if bone:
+        if pb:
 
-            bone.hide = False
+            pb.bone.hide = False
 
             if self.shift:
-                # Toggle selection
-                bone.select = not bone.select
+                pb.select = not pb.select
             else:
-                bone.select = True
+                pb.select = True
 
-            rig.data.bones.active = bone
+            rig.data.bones.active = pb.bone
 
         return {'FINISHED'}
 
@@ -158,8 +165,8 @@ class RP_OT_ShowAll(bpy.types.Operator):
 
         ensure_pose(context, rig)
 
-        for bone in rig.data.bones:
-            bone.hide = False
+        for pb in rig.pose.bones:
+            pb.bone.hide = False
 
         return {'FINISHED'}
 
@@ -183,8 +190,8 @@ class RP_OT_HideAll(bpy.types.Operator):
 
         ensure_pose(context, rig)
 
-        for bone in rig.data.bones:
-            bone.hide = True
+        for pb in rig.pose.bones:
+            pb.bone.hide = True
 
         return {'FINISHED'}
 

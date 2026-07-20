@@ -193,18 +193,22 @@ class Controller:
             widget.active = True
             widget.update()
 
-        # Select every bone in Blender
-        rig = bpy.data.objects.get("Sky_Rig")
+        rig = bpy.context.active_object
+
+        if not rig or rig.type != 'ARMATURE':
+            return
+
         if rig:
-            for bone in rig.data.bones:
-                bone.hide = False
-                bone.select = False
+            for pb in rig.pose.bones:
+                pb.bone.hide = True
+                pb.select = False
 
             for bone_name in self.selected_bones:
-                bone = rig.data.bones.get(bone_name)
-                if bone:
-                    bone.hide = False
-                    bone.select = True
+                pb = rig.pose.bones.get(bone_name)
+
+                if pb:
+                    pb.bone.hide = False
+                    pb.select = True
 
         # Update appearance controls
         if self.selected_bones:
@@ -236,10 +240,12 @@ class Controller:
         self.window.shape_combo.setEnabled(False)
         self.window.color_combo.setEnabled(False)
 
-        # Deselect bones in Blender
-        rig = bpy.data.objects.get("Sky_Rig")
+        rig = bpy.context.active_object
+
+        if not rig or rig.type != 'ARMATURE':
+            return
         if rig:
-            for bone in rig.data.bones:
-                bone.select = False
-                bone.hide = True
+            for pb in rig.pose.bones:
+                pb.select = False
+                pb.bone.hide = True
             rig.data.bones.active = None

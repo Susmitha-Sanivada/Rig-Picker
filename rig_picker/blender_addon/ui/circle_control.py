@@ -71,7 +71,7 @@ class CircleControl(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        margin = max(1, round(4 * self.display_scale))
+        margin = max(2, round(4 * self.display_scale))
         rect = self.rect().adjusted(margin, margin, -margin, -margin)
 
         color = QColor(self.color)

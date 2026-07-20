@@ -1,6 +1,8 @@
 import bpy
 import sys
 
+from . import backend
+
 
 class RP_OT_OpenPicker(bpy.types.Operator):
     bl_idname = "rigpicker.open"
@@ -13,7 +15,10 @@ class RP_OT_OpenPicker(bpy.types.Operator):
             from .ui.launcher import show_picker
 
             
+            obj = context.object
 
+            if obj and obj.type == 'ARMATURE':
+                backend.set_armature(obj)
             show_picker()
 
             self.report({'INFO'}, "Rig Picker Opened")
