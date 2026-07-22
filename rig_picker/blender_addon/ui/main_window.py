@@ -14,7 +14,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QMenu,
     QStatusBar,
-    QSizePolicy
+    QSizePolicy,
+    QCheckBox
 )
 from PySide6.QtCore import Qt, QPoint, QRectF
 from PySide6.QtGui import QPainterPath, QRegion
@@ -161,6 +162,9 @@ class RigPickerWindow(QMainWindow):
         size_layout.addWidget(self.size_combo)
         selection_row.addWidget(size_field)
 
+        self.symmetry_checkbox = QCheckBox("Symmetry")
+        layout.addWidget(self.symmetry_checkbox)
+
         selection_row.addSpacing(8)
 
         shape_field = QWidget()
@@ -275,6 +279,10 @@ class RigPickerWindow(QMainWindow):
         )
         self.color_combo.currentIndexChanged.connect(
             lambda index: self.controller.set_selected_color(self.color_combo.itemData(index))
+        )
+
+        self.symmetry_checkbox.toggled.connect(
+            self.controller.toggle_symmetry
         )
 
         # ----------------------------------------------------

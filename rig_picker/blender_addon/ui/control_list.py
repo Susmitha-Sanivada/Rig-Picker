@@ -8,10 +8,15 @@ from PySide6.QtWidgets import (
     QWidget,
     QScrollArea,
 )
+from PySide6.QtGui import (
+    QPen,
+    QColor,
+)
+import bpy
 
 from .circle_control import CircleControl
-from PySide6.QtGui import QPixmap, QPainter,QImage
-from PySide6.QtCore import Qt, QPoint
+from PySide6.QtGui import QPixmap, QPainter, QImage, QPolygon
+from PySide6.QtCore import Qt, QPoint, QRect
 
 
 class ControlList(QScrollArea):
@@ -23,7 +28,7 @@ class ControlList(QScrollArea):
         self.controls = {}
 
         self.container = PickerCanvas()
-
+        self.container.control_list = self
 
         self.setWidgetResizable(True)
 
@@ -121,8 +126,19 @@ class PickerCanvas(QWidget):
         self.image_offset_y = 0.0
 
         # Dragging state
-        self.dragging = False
         self.drag_start = None
+
+        self.symmetry_enabled = False
+
+        self.symmetry_x = -1
+
+        self.dragging_symmetry = False
+
+        self.dragging_image = False
+        self.dragging_symmetry = False
+
+        self.symmetry_handle_size = 14
+        self.symmetry_handle_hover = False
 
     def scaled_background(self):
         if self.background is None:
@@ -166,15 +182,45 @@ class PickerCanvas(QWidget):
     def move_control_from_canvas(self, control, position):
         """Move a control from a drag and persist its image-relative position."""
         control.image_position = self.canvas_to_image_position(position)
-        self.layout_controls()
 
         import bpy
 
-        for item in bpy.context.scene.rp_items:
+        scene = bpy.context.scene
+
+        if scene.rp_symmetry:
+
+            from ..backend import mirror_name
+
+            mirror_bone = mirror_name(control.bone_name)
+
+            if mirror_bone:
+
+                mirror_control = self.control_list.controls.get(mirror_bone)
+
+                if mirror_control:
+
+                    CONTROL_SIZE = control.size
+
+                    center = control.image_position.x() + CONTROL_SIZE / 2
+                    mirror_center = 2 * scene.rp_symmetry_x - center
+                    mirror_x = mirror_center - CONTROL_SIZE / 2
+
+                    mirror_control.image_position.setX(round(mirror_x))
+                    mirror_control.image_position.setY(control.image_position.y())
+
+                    for item in scene.rp_items:
+                        if item.bone_name == mirror_bone:
+                            item.x = mirror_control.image_position.x()
+                            item.y = mirror_control.image_position.y()
+                            break
+
+        for item in scene.rp_items:
             if item.bone_name == control.bone_name:
                 item.x = control.image_position.x()
                 item.y = control.image_position.y()
                 break
+
+        self.layout_controls()
 
     def paintEvent(self, event):
 
@@ -192,6 +238,50 @@ class PickerCanvas(QWidget):
             self.image_y,
             pixmap
         )
+        if self.symmetry_enabled and self.symmetry_x >= 0:
+
+            painter.setPen(
+                QPen(QColor(255,0,0),2)
+            )
+            canvas_x = self.image_x + self.symmetry_x * self.image_scale()
+
+            # ---------------------------------------------------------
+            # Draw symmetry guide
+            # ---------------------------------------------------------
+
+            canvas_x = self.image_x + self.symmetry_x * self.image_scale()
+
+            # Dashed white line
+            pen = QPen(Qt.white, 2)
+            pen.setStyle(Qt.DashLine)
+            pen.setCapStyle(Qt.RoundCap)
+
+            painter.setPen(pen)
+
+            triangle_height = 10
+            line_top = self.image_y + triangle_height + 2
+            line_bottom = (
+                self.image_y
+                + self.background.height() * self.image_scale()
+            )
+
+            painter.drawLine(
+                QPoint(canvas_x, line_top),
+                QPoint(canvas_x, line_bottom)
+            )
+
+            # Draw triangle handle
+            triangle_width = 14
+
+            triangle = QPolygon([
+                QPoint(int(canvas_x), int(line_top - triangle_height)),
+                QPoint(int(canvas_x - triangle_width / 2), int(line_top)),
+                QPoint(int(canvas_x + triangle_width / 2), int(line_top)),
+            ])
+
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(Qt.white)
+            painter.drawPolygon(triangle)
 
     def mousePressEvent(self, event):
 
@@ -237,15 +327,64 @@ class PickerCanvas(QWidget):
                 window = self.window()
                 if hasattr(window, "controller"):
                     window.controller.deselect_all()
+                    window.controller.hide_all()
 
-                self.dragging = True
+                if self.symmetry_enabled:
+                    
+                    if (
+                        self.symmetry_enabled and
+                        self.symmetry_handle_rect().contains(
+                            event.position().toPoint()
+                        )
+                    ):
+                        self.dragging_symmetry = True
+                        return
+
+                self.dragging_image = True
                 self.drag_start = click_pos
 
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        hover = self.symmetry_handle_rect().contains(
+            event.position().toPoint()
+        )
+        if hover != self.symmetry_handle_hover:
+            self.symmetry_handle_hover = hover
+            self.update()
 
-        if self.dragging:
+        if self.dragging_symmetry:
+
+            image_x = self.canvas_to_image_position(
+                QPoint(event.position().x(), 0)
+            ).x()
+
+            # Keep symmetry line inside the image
+            image_x = max(
+                0,
+                min(image_x, self.background.width())
+            )
+
+            delta = image_x - self.symmetry_x
+
+            self.symmetry_x = image_x
+            bpy.context.scene.rp_symmetry_x = image_x
+
+            # Move every control by the same amount
+            for control in self.findChildren(CircleControl):
+                control.image_position.setX(
+                    control.image_position.x() + delta
+                )
+
+            # Update Blender's stored positions
+            for item in bpy.context.scene.rp_items:
+                item.x += delta
+
+            self.layout_controls()
+            self.update()
+            return
+
+        if self.dragging_image:
 
             current = event.position().toPoint()
 
@@ -365,3 +504,27 @@ class PickerCanvas(QWidget):
 
         self.layout_controls()
         self.update()
+
+    def mouseReleaseEvent(self, event):
+
+        self.dragging_image = False
+        self.dragging_symmetry = False
+
+        super().mouseReleaseEvent(event)
+    
+
+    def symmetry_handle_rect(self):
+
+        if self.symmetry_x < 0:
+            return QRect()
+
+        canvas_x = self.image_x + self.symmetry_x * self.image_scale()
+
+        size = self.symmetry_handle_size
+
+        return QRect(
+            int(canvas_x - 12),
+            0,
+            24,
+            28
+        )

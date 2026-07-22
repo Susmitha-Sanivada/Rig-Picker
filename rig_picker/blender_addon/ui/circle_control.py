@@ -191,6 +191,22 @@ class CircleControl(QWidget):
                 )
             )
 
+            canvas = self.parent()
+
+            if (
+                canvas.symmetry_enabled and
+                canvas.symmetry_x >= 0
+            ):
+                symmetry_canvas_x = (
+                    canvas.image_x +
+                    canvas.symmetry_x * canvas.image_scale()
+                )
+
+                center = x + self.width() / 2
+
+                if abs(center - symmetry_canvas_x) < 8:
+                    x = symmetry_canvas_x - self.width() / 2
+
             parent.move_control_from_canvas(self, QPoint(x, y))
             event.accept()
             return

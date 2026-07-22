@@ -14,11 +14,12 @@ class RP_OT_OpenPicker(bpy.types.Operator):
             # Import only when button is clicked
             from .ui.launcher import show_picker
 
-            
             obj = context.object
 
+            # Cache the armature directly if an armature is active
             if obj and obj.type == 'ARMATURE':
-                backend.set_armature(obj)
+                backend._CACHED_ARM = obj
+
             show_picker()
 
             self.report({'INFO'}, "Rig Picker Opened")
