@@ -5,6 +5,12 @@ import bpy
 # Global cache for the active armature reference
 _CACHED_ARM: bpy.types.Object | None = None
 
+# Per-armature picker cache
+_PICKER_CACHE = {}
+
+_ACTIVE_CONTROLLER = None
+_ACTIVE_WINDOW = None
+
 
 # ---------------------------------------------------------
 # DATA
@@ -48,7 +54,63 @@ def update_armature_cache(scene=None, depsgraph=None):
     # Only update reference if we are actively in POSE mode on an Armature
     if obj and obj.type == 'ARMATURE' and obj.mode == 'POSE':
         if _CACHED_ARM != obj:
+            save_picker_state(_CACHED_ARM)
             _CACHED_ARM = obj
+            load_picker_state(_CACHED_ARM)
+
+            # Refresh the picker UI if it is open
+            if _ACTIVE_CONTROLLER is not None:
+                try:
+                    _ACTIVE_CONTROLLER.refresh()
+                except Exception:
+                    pass
+
+
+
+
+def save_picker_state(rig):
+    """Save scene picker state for the given armature."""
+    if rig is None:
+        return
+    scene = bpy.context.scene
+    _PICKER_CACHE[rig.name] = {
+        "background": scene.rp_background_image,
+        "symmetry": scene.rp_symmetry,
+        "symmetry_x": scene.rp_symmetry_x,
+        "items": [
+            {
+                "bone_name": i.bone_name,
+                "label": i.label,
+                "x": i.x,
+                "y": i.y,
+                "control_size": i.control_size,
+                "control_shape": i.control_shape,
+                "control_color": i.control_color,
+            }
+            for i in scene.rp_items
+        ],
+    }
+
+
+def load_picker_state(rig):
+    """Restore scene picker state for the given armature."""
+    if rig is None:
+        return
+    scene = bpy.context.scene
+    state = _PICKER_CACHE.get(rig.name)
+    scene.rp_items.clear()
+    if not state:
+        scene.rp_background_image = ""
+        scene.rp_symmetry = False
+        scene.rp_symmetry_x = -1.0
+        return
+    scene.rp_background_image = state["background"]
+    scene.rp_symmetry = state["symmetry"]
+    scene.rp_symmetry_x = state["symmetry_x"]
+    for d in state["items"]:
+        item = scene.rp_items.add()
+        for k,v in d.items():
+            setattr(item,k,v)
 
 
 def ensure_pose(context, rig):

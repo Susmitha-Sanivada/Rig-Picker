@@ -15,6 +15,7 @@ from .operators import (
     RP_PT_MainPanel,
 )
 
+from . import backend
 from .backend import (
     RP_Item,
     RP_OT_Add,
@@ -54,6 +55,10 @@ def register():
         bpy.utils.register_class(cls)
 
     ensure_qt()
+
+    # Initialize backend UI references
+    backend._ACTIVE_CONTROLLER = None
+    backend._ACTIVE_WINDOW = None
 
     # ----------------------------------------------------
     # Register Armature Cache Handler

@@ -27,6 +27,7 @@ class Controller:
     def set_window(self, window):
         self.window = window
 
+
     # ---------------------------------------------------------
 
     def refresh(self):
@@ -60,6 +61,9 @@ class Controller:
 
             widget = self.window.control_list.controls[item.bone_name]
             self.window.connect_item(widget)
+
+        self.window.control_list.container.layout_controls()
+        self.window.control_list.container.update()
 
     # ---------------------------------------------------------
 
