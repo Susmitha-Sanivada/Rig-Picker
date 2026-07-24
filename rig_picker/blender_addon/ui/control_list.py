@@ -12,7 +12,6 @@ from PySide6.QtGui import (
     QPen,
     QColor,
 )
-import bpy
 
 from .circle_control import CircleControl
 from PySide6.QtGui import QPixmap, QPainter, QImage, QPolygon
@@ -69,11 +68,24 @@ class ControlList(QScrollArea):
     def clear_controls(self):
 
         for control in self.controls.values():
+            # hide() immediately makes it invisible; deleteLater() defers
+            # the actual C++ destruction to the next event loop tick.
+            #
+            # Deliberately NOT calling setParent(None) here: reparenting a
+            # widget to no parent turns it into its own top-level window,
+            # which is unnecessary and risks it flashing as a stray
+            # floating window before deleteLater() finishes it off. It's
+            # unnecessary because layout_controls(), hit-testing, and the
+            # symmetry drag all read from this `controls` dict (not Qt's
+            # live widget tree), so once a control is removed from here it
+            # can never be touched again regardless of when Qt actually
+            # deletes the underlying widget.
+            control.hide()
             control.deleteLater()
 
         self.controls.clear()
 
-    def set_background(self, image_path):
+    def set_background(self, image_path, offset_x=0.0, offset_y=0.0):
 
         image = QImage(image_path)
 
@@ -101,6 +113,22 @@ class ControlList(QScrollArea):
 
         self.container.background = pixmap
 
+        # Restore the saved relative drag position (0..1) instead of
+        # always resetting to the top-left corner, so switching back to
+        # an armature keeps its previously-dragged image position.
+        self.container.image_offset_x = offset_x
+        self.container.image_offset_y = offset_y
+
+        self.container.apply_image_offset()
+        self.container.layout_controls()
+        self.container.update()
+
+    def clear_background(self):
+        """Removes the background image (e.g. when switching to an armature
+        that has no captured view saved yet)."""
+
+        self.container.background = None
+
         self.container.image_x = 0
         self.container.image_y = 0
 
@@ -116,6 +144,10 @@ class PickerCanvas(QWidget):
         super().__init__()
 
         self.background = None
+
+        # Set by ControlList right after construction; defaulted here so
+        # it's always safe to reference even before that happens.
+        self.control_list = None
 
         # Background image position
         self.image_x = 0
@@ -169,25 +201,36 @@ class PickerCanvas(QWidget):
         """Apply the current image transform to every picker control."""
         scale = self.image_scale()
 
-        for control in self.findChildren(CircleControl):
+        controls = (
+            self.control_list.controls.values()
+            if self.control_list is not None
+            else self.findChildren(CircleControl)
+        )
+
+        for control in controls:
             if not hasattr(control, "image_position"):
                 control.image_position = self.canvas_to_image_position(control.pos())
 
             control.set_display_scale(scale)
+            display_x = self.image_x + control.image_position.x() * scale
+            display_y = self.image_y + control.image_position.y() * scale
+
             control.move(
-                round(self.image_x + control.image_position.x() * scale),
-                round(self.image_y + control.image_position.y() * scale),
+                int(display_x),
+                int(display_y),
             )
 
     def move_control_from_canvas(self, control, position):
         """Move a control from a drag and persist its image-relative position."""
         control.image_position = self.canvas_to_image_position(position)
 
-        import bpy
+        controller = getattr(self.window(), "controller", None)
 
-        scene = bpy.context.scene
+        if controller is None:
+            self.layout_controls()
+            return
 
-        if scene.rp_symmetry:
+        if controller.data.get("symmetry"):
 
             from ..backend import mirror_name
 
@@ -201,25 +244,27 @@ class PickerCanvas(QWidget):
 
                     CONTROL_SIZE = control.size
 
-                    center = control.image_position.x() + CONTROL_SIZE / 2
-                    mirror_center = 2 * scene.rp_symmetry_x - center
-                    mirror_x = mirror_center - CONTROL_SIZE / 2
+                    center = control.image_position.x() + CONTROL_SIZE // 2
+                    mirror_center = (
+                        2 * controller.data["symmetry_x"]
+                        - center
+                    )
+                    mirror_x = mirror_center - CONTROL_SIZE // 2
 
-                    mirror_control.image_position.setX(round(mirror_x))
+                    mirror_control.image_position.setX(int(mirror_x))
                     mirror_control.image_position.setY(control.image_position.y())
 
-                    for item in scene.rp_items:
-                        if item.bone_name == mirror_bone:
-                            item.x = mirror_control.image_position.x()
-                            item.y = mirror_control.image_position.y()
-                            break
+                    mirror_item = controller.find_item(mirror_bone)
+                    if mirror_item:
+                        mirror_item["x"] = mirror_control.image_position.x()
+                        mirror_item["y"] = mirror_control.image_position.y()
 
-        for item in scene.rp_items:
-            if item.bone_name == control.bone_name:
-                item.x = control.image_position.x()
-                item.y = control.image_position.y()
-                break
+        item = controller.find_item(control.bone_name)
+        if item:
+            item["x"] = control.image_position.x()
+            item["y"] = control.image_position.y()
 
+        controller.save()
         self.layout_controls()
 
     def paintEvent(self, event):
@@ -302,7 +347,13 @@ class PickerCanvas(QWidget):
                 nearest = None
                 nearest_dist2 = PICK_RADIUS * PICK_RADIUS
 
-                for control in self.findChildren(CircleControl):
+                controls = (
+                    self.control_list.controls.values()
+                    if self.control_list is not None
+                    else self.findChildren(CircleControl)
+                )
+
+                for control in controls:
 
                     center = control.geometry().center()
 
@@ -368,17 +419,28 @@ class PickerCanvas(QWidget):
             delta = image_x - self.symmetry_x
 
             self.symmetry_x = image_x
-            bpy.context.scene.rp_symmetry_x = image_x
+
+            controller = getattr(self.window(), "controller", None)
+
+            if controller is not None:
+                controller.data["symmetry_x"] = image_x
+
+                for item in controller.data["items"]:
+                    item["x"] += delta
+
+                controller.save()
 
             # Move every control by the same amount
-            for control in self.findChildren(CircleControl):
+            controls = (
+                self.control_list.controls.values()
+                if self.control_list is not None
+                else self.findChildren(CircleControl)
+            )
+
+            for control in controls:
                 control.image_position.setX(
                     control.image_position.x() + delta
                 )
-
-            # Update Blender's stored positions
-            for item in bpy.context.scene.rp_items:
-                item.x += delta
 
             self.layout_controls()
             self.update()
@@ -452,10 +514,15 @@ class PickerCanvas(QWidget):
 
         super().mouseMoveEvent(event)
 
-    def resizeEvent(self, event):
+    def apply_image_offset(self):
+        """Positions the background image according to the stored relative
+        offset (0..1 range, independent of canvas size), re-deriving
+        image_x/image_y for the current canvas size.
 
-        super().resizeEvent(event)
-
+        Used both on resize and right after a background is (re)loaded, so
+        a previously-dragged position is restored instead of resetting to
+        the top-left corner.
+        """
         if not self.background:
             return
 
@@ -472,43 +539,50 @@ class PickerCanvas(QWidget):
         canvas_h = self.height()
 
         if image_w >= canvas_w:
-
             min_x = canvas_w - image_w
             max_x = 0
-
         else:
-
             min_x = 0
             max_x = canvas_w - image_w
 
         if image_h >= canvas_h:
-
             min_y = canvas_h - image_h
             max_y = 0
-
         else:
-
             min_y = 0
             max_y = canvas_h - image_h
 
         available_x = max(1, max_x - min_x)
         available_y = max(1, max_y - min_y)
 
-        self.image_x = int(
-            min_x + self.image_offset_x * available_x
-        )
+        self.image_x = int(min_x + self.image_offset_x * available_x)
+        self.image_y = int(min_y + self.image_offset_y * available_y)
 
-        self.image_y = int(
-            min_y + self.image_offset_y * available_y
-        )
+    def resizeEvent(self, event):
+
+        super().resizeEvent(event)
+
+        if not self.background:
+            return
+
+        self.apply_image_offset()
 
         self.layout_controls()
         self.update()
 
     def mouseReleaseEvent(self, event):
 
+        was_dragging_image = self.dragging_image
+
         self.dragging_image = False
         self.dragging_symmetry = False
+
+        if was_dragging_image:
+            controller = getattr(self.window(), "controller", None)
+            if controller is not None:
+                controller.data["image_offset_x"] = self.image_offset_x
+                controller.data["image_offset_y"] = self.image_offset_y
+                controller.save()
 
         super().mouseReleaseEvent(event)
     

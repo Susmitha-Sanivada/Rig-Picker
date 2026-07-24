@@ -21,10 +21,12 @@ def show_picker():
     import shiboken6
     from .main_window import RigPickerWindow
 
-    if (
+    is_new_window = (
         _window is None
         or not shiboken6.isValid(_window)
-    ):
+    )
+
+    if is_new_window:
 
         _window = RigPickerWindow(
             parent=app.blender_widget
@@ -43,6 +45,13 @@ def show_picker():
         y = blender_rect.top() + 30
 
         _window.move(x, y)
+
+    else:
+        # Window already exists (just hidden) - the active armature may
+        # have changed since it was last shown, so make sure the picker
+        # reflects it.
+        from ..backend import arm
+        _window.controller.load_armature(arm())
 
     _window.show()
     _window.raise_()

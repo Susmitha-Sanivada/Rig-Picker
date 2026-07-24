@@ -142,27 +142,30 @@ def has_bqt():
 # Initialization
 # ----------------------------------------------------------
 
+_BQT_INITIALIZED = False
+
+
 def initialize_bqt():
+    global _BQT_INITIALIZED
+
     add_python_path()
-    
+
     from PySide6.QtWidgets import QApplication
 
     app = QApplication.instance()
 
-    if app is not None:
+    if app is not None and _BQT_INITIALIZED:
         return app
 
-    import bqt
-
-    bqt.register()
+    if not _BQT_INITIALIZED:
+        import bqt
+        bqt.register()
+        _BQT_INITIALIZED = True
 
     app = QApplication.instance()
 
     if app is None:
-
-        raise RuntimeError(
-            "Unable to initialize BQT."
-        )
+        raise RuntimeError("Unable to initialize BQT.")
 
     return app
 

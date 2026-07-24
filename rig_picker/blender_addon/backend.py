@@ -5,25 +5,23 @@ import bpy
 # Global cache for the active armature reference
 _CACHED_ARM: bpy.types.Object | None = None
 
-# Per-armature picker cache
-_PICKER_CACHE = {}
+# Name of the armature _CACHED_ARM refers to. Change detection is done by
+# name, not object identity - Blender can hand back a fresh Python
+# wrapper/evaluated-copy instance for the logically same armature between
+# checks, and comparing by identity would treat that as a "different"
+# armature and trigger a needless reload.
+_CACHED_ARM_NAME: str | None = None
 
 _ACTIVE_CONTROLLER = None
 _ACTIVE_WINDOW = None
 
-
-# ---------------------------------------------------------
-# DATA
-# ---------------------------------------------------------
-
-class RP_Item(bpy.types.PropertyGroup):
-    bone_name: bpy.props.StringProperty()
-    label: bpy.props.StringProperty()
-    x: bpy.props.FloatProperty(default=-1.0)
-    y: bpy.props.FloatProperty(default=-1.0)
-    control_size: bpy.props.IntProperty(default=36)
-    control_shape: bpy.props.StringProperty(default="CIRCLE")
-    control_color: bpy.props.StringProperty(default="GREEN")
+# How often (seconds) to check whether a different armature has become
+# active. Selecting an object in the viewport doesn't always run
+# depsgraph_update_post - that handler is meant for actual data changes
+# (transforms, mode switches, etc.) and isn't a reliable signal for a pure
+# active-object/selection change. A lightweight poll sidesteps that
+# entirely and is imperceptible to the user at this interval.
+_POLL_INTERVAL = 0.15
 
 
 # ---------------------------------------------------------
@@ -32,85 +30,56 @@ class RP_Item(bpy.types.PropertyGroup):
 
 def arm() -> bpy.types.Object | None:
     """Returns the cached armature reference without re-checking mode continuously."""
-    global _CACHED_ARM
+    global _CACHED_ARM, _CACHED_ARM_NAME
 
     if _CACHED_ARM is None:
         obj = bpy.context.active_object
         if obj and obj.type == 'ARMATURE':
             _CACHED_ARM = obj
+            _CACHED_ARM_NAME = obj.name
 
     return _CACHED_ARM
 
 
-def update_armature_cache(scene=None, depsgraph=None):
-    """Callback function: updates _CACHED_ARM safely during depsgraph updates."""
-    global _CACHED_ARM
+def poll_active_armature():
+    """Runs every _POLL_INTERVAL seconds via bpy.app.timers.
 
-    # Safely get active object without triggering AttributeError on context
-    obj = getattr(bpy.context, "active_object", None)
-    if not obj and hasattr(bpy.context, "view_layer"):
-        obj = bpy.context.view_layer.objects.active
+    Detects when a different armature has become active (in either Object
+    Mode or Pose Mode) and reloads the picker for it. Registered with
+    persistent=True in register(), so it keeps running across File > Open
+    without needing to be re-registered.
 
-    # Only update reference if we are actively in POSE mode on an Armature
-    if obj and obj.type == 'ARMATURE' and obj.mode == 'POSE':
-        if _CACHED_ARM != obj:
-            save_picker_state(_CACHED_ARM)
-            _CACHED_ARM = obj
-            load_picker_state(_CACHED_ARM)
+    Unlike depsgraph_update_post, a timer callback isn't a restricted
+    context, so the reload can happen directly here - no need to defer it
+    another tick.
+    """
+    global _CACHED_ARM, _CACHED_ARM_NAME
 
-            # Refresh the picker UI if it is open
-            if _ACTIVE_CONTROLLER is not None:
-                try:
-                    _ACTIVE_CONTROLLER.refresh()
-                except Exception:
-                    pass
+    try:
+        obj = getattr(bpy.context, "active_object", None)
+        if not obj and hasattr(bpy.context, "view_layer"):
+            obj = bpy.context.view_layer.objects.active
 
+        if obj and obj.type == 'ARMATURE':
+            if obj.name != _CACHED_ARM_NAME:
+                _CACHED_ARM = obj
+                _CACHED_ARM_NAME = obj.name
 
+                if _ACTIVE_CONTROLLER is not None:
+                    try:
+                        _ACTIVE_CONTROLLER.load_armature(obj)
+                    except Exception:
+                        import traceback
+                        traceback.print_exc()
+            else:
+                # Same armature logically; keep the reference fresh.
+                _CACHED_ARM = obj
 
+    except Exception:
+        import traceback
+        traceback.print_exc()
 
-def save_picker_state(rig):
-    """Save scene picker state for the given armature."""
-    if rig is None:
-        return
-    scene = bpy.context.scene
-    _PICKER_CACHE[rig.name] = {
-        "background": scene.rp_background_image,
-        "symmetry": scene.rp_symmetry,
-        "symmetry_x": scene.rp_symmetry_x,
-        "items": [
-            {
-                "bone_name": i.bone_name,
-                "label": i.label,
-                "x": i.x,
-                "y": i.y,
-                "control_size": i.control_size,
-                "control_shape": i.control_shape,
-                "control_color": i.control_color,
-            }
-            for i in scene.rp_items
-        ],
-    }
-
-
-def load_picker_state(rig):
-    """Restore scene picker state for the given armature."""
-    if rig is None:
-        return
-    scene = bpy.context.scene
-    state = _PICKER_CACHE.get(rig.name)
-    scene.rp_items.clear()
-    if not state:
-        scene.rp_background_image = ""
-        scene.rp_symmetry = False
-        scene.rp_symmetry_x = -1.0
-        return
-    scene.rp_background_image = state["background"]
-    scene.rp_symmetry = state["symmetry"]
-    scene.rp_symmetry_x = state["symmetry_x"]
-    for d in state["items"]:
-        item = scene.rp_items.add()
-        for k,v in d.items():
-            setattr(item,k,v)
+    return _POLL_INTERVAL  # returning a number reschedules the timer
 
 
 def ensure_pose(context, rig):
@@ -120,6 +89,19 @@ def ensure_pose(context, rig):
             context.view_layer.objects.active = rig
     except Exception:
         pass
+
+
+def ensure_pose_mode(context, rig):
+    """Switches the rig into Pose Mode if it isn't already.
+
+    pose.* operators (reveal, hide, select_all...) poll() against
+    context.active_object.mode == 'POSE'. Overriding "active_object" in
+    temp_override does not change the object's actual mode, so without this
+    the operators fail with "context is incorrect" whenever the picker is
+    used while the rig is in Object Mode.
+    """
+    if rig and rig.mode != 'POSE':
+        bpy.ops.object.mode_set(mode='POSE')
 
 
 def refresh_3d_view(context):
@@ -163,55 +145,6 @@ def mirror_name(name):
 
 
 # ---------------------------------------------------------
-# ADD SELECTED
-# ---------------------------------------------------------
-
-class RP_OT_Add(bpy.types.Operator):
-    bl_idname = "rp.add_selected"
-    bl_label = "Add Selected Controls"
-
-    def execute(self, context):
-        rig = arm()
-        if not rig:
-            return {'CANCELLED'}
-
-        existing = {item.bone_name for item in context.scene.rp_items}
-
-        for pb in rig.pose.bones:
-            if not pb.select or pb.name in existing:
-                continue
-
-            item = context.scene.rp_items.add()
-            item.bone_name = pb.name
-            item.label = pb.name
-
-            scene = context.scene
-            mirror = mirror_name(pb.name)
-
-            if scene.rp_symmetry and mirror is not None:
-                mirror_item = next((i for i in scene.rp_items if i.bone_name == mirror), None)
-
-                if mirror_item and mirror_item.x >= 0 and mirror_item.y >= 0:
-
-                    CONTROL_SIZE = 36.0
-
-                    mirror_center = mirror_item.x + CONTROL_SIZE / 2
-                    new_center = 2 * scene.rp_symmetry_x - mirror_center
-
-                    item.x = new_center - CONTROL_SIZE / 2
-                    item.y = mirror_item.y
-
-                else:
-                    item.x = -1.0
-                    item.y = -1.0
-            else:
-                item.x = -1.0
-                item.y = -1.0
-
-        return {'FINISHED'}
-
-
-# ---------------------------------------------------------
 # SELECT
 # ---------------------------------------------------------
 
@@ -233,6 +166,7 @@ class RP_OT_Select(bpy.types.Operator):
 
         with context.temp_override(**override):
             context.view_layer.objects.active = rig
+            ensure_pose_mode(context, rig)
 
             target_pb = rig.pose.bones.get(self.bone_name)
             if not target_pb:
@@ -300,6 +234,7 @@ class RP_OT_ShowAll(bpy.types.Operator):
 
         with context.temp_override(**override):
             context.view_layer.objects.active = rig
+            ensure_pose_mode(context, rig)
             bpy.ops.pose.reveal(select=False)
 
         refresh_3d_view(context)
@@ -325,6 +260,7 @@ class RP_OT_HideAll(bpy.types.Operator):
 
         with context.temp_override(**override):
             context.view_layer.objects.active = rig
+            ensure_pose_mode(context, rig)
 
             bpy.ops.pose.reveal(select=False)
             bpy.ops.pose.select_all(action='DESELECT')
@@ -332,61 +268,6 @@ class RP_OT_HideAll(bpy.types.Operator):
 
         refresh_3d_view(context)
         return {'FINISHED'}
-
-
-# ---------------------------------------------------------
-# REMOVE
-# ---------------------------------------------------------
-
-class RP_OT_Remove(bpy.types.Operator):
-    bl_idname = "rp.remove"
-    bl_label = "Remove Control"
-
-    index: bpy.props.IntProperty()
-
-    def execute(self, context):
-        items = context.scene.rp_items
-
-        if 0 <= self.index < len(items):
-            items.remove(self.index)
-
-        bpy.ops.rp.hide_all()
-        return {'FINISHED'}
-
-
-class RP_OT_RemoveByName(bpy.types.Operator):
-    bl_idname = "rp.remove_by_name"
-    bl_label = "Remove Control"
-
-    bone_name: bpy.props.StringProperty()
-
-    def execute(self, context):
-        items = context.scene.rp_items
-
-        for i in reversed(range(len(items))):
-            if items[i].bone_name == self.bone_name:
-                items.remove(i)
-                break
-
-        bpy.ops.rp.hide_all()
-        return {'FINISHED'}
-
-
-# ---------------------------------------------------------
-# CLEAR ALL
-# ---------------------------------------------------------
-
-class RP_OT_ClearAll(bpy.types.Operator):
-    bl_idname = "rp.clear_all"
-    bl_label = "Clear All Controls"
-
-    def execute(self, context):
-        context.scene.rp_items.clear()
-        bpy.ops.rp.hide_all()
-        return {'FINISHED'}
-
-
-
 
 
 # ---------------------------------------------------------
@@ -441,7 +322,6 @@ class RP_OT_CaptureView(bpy.types.Operator):
             self.report({'ERROR'}, "Could not capture viewport.")
             return {'CANCELLED'}
 
-        scene.rp_background_image = image_path
         self.report({'INFO'}, "Viewport captured.")
 
         return {'FINISHED'}

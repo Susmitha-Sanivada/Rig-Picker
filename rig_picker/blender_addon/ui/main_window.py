@@ -80,8 +80,15 @@ class RigPickerWindow(QMainWindow):
 
         self.build_ui()
 
-        # Load existing controls from Blender
-        self.controller.refresh()
+        # Make this the addon's single active controller, so the
+        # depsgraph handler in backend.py can refresh it automatically
+        # whenever the active armature changes.
+        from .. import backend
+        backend._ACTIVE_CONTROLLER = self.controller
+        backend._ACTIVE_WINDOW = self
+
+        # Load the currently active armature's picker from JSON
+        self.controller.load_armature(backend.arm())
 
         self.setFocusPolicy(Qt.StrongFocus)
         self.setFocus()

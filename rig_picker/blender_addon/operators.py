@@ -2,6 +2,7 @@ import bpy
 import sys
 
 from . import backend
+from .dependency import ensure_qt
 
 
 class RP_OT_OpenPicker(bpy.types.Operator):
@@ -19,6 +20,9 @@ class RP_OT_OpenPicker(bpy.types.Operator):
             # Cache the armature directly if an armature is active
             if obj and obj.type == 'ARMATURE':
                 backend._CACHED_ARM = obj
+                backend._CACHED_ARM_NAME = obj.name
+
+            ensure_qt()
 
             show_picker()
 
