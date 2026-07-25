@@ -367,17 +367,20 @@ class Controller:
         from ..backend import arm
         rig = arm()
 
-        if rig and rig.type == 'ARMATURE':
-            for pb in rig.pose.bones:
-                if pb.name in self.selected_bones:
-                    pb.bone.hide = False
-                    pb.select = True
-                else:
-                    pb.bone.hide = True
-                    pb.select = False
+        from ..backend import (
+            get_3d_override,
+            ensure_pose_mode,
+        )
 
-            # Refresh 3D Viewport immediately
-            refresh_3d_view(bpy.context)
+        if rig and rig.type == "ARMATURE":
+            override = get_3d_override(bpy.context, rig)
+
+            if override:
+                with bpy.context.temp_override(**override):
+                    ensure_pose_mode(bpy.context, rig)
+
+                    bpy.ops.pose.reveal(select=False)
+                    bpy.ops.pose.select_all(action="SELECT")
 
         # Update appearance control dropdowns
         if self.selected_bones:
