@@ -34,17 +34,44 @@ def show_picker():
 
         _window.setObjectName("RigPicker")
 
-         # -----------------------------
-        # Position relative to Blender
         # -----------------------------
-        _window.adjustSize()
+        # Position
+        # -----------------------------
+        # NOTE: intentionally NOT calling _window.adjustSize() here.
+        # The window's size was already restored from rig_picker_data.json
+        # inside RigPickerWindow.__init__() (self.resize(width, height)).
+        # adjustSize() would immediately discard that and snap the window
+        # back to its layout's sizeHint(), which is exactly why the saved
+        # size never appeared to "stick" on reopen.
+        from .. import json_manager
 
-        blender_rect = app.blender_widget.frameGeometry()
+        saved_pos = json_manager.get_window_position()
+        restored = False
 
-        x = blender_rect.right() - _window.width() - 10
-        y = blender_rect.top() + 30
+        if saved_pos is not None:
+            x, y = saved_pos
 
-        _window.move(x, y)
+            # Sanity-check the saved position against currently available
+            # screens before trusting it - e.g. it may have been saved on
+            # a second monitor that isn't connected this time, which would
+            # otherwise place the window somewhere the user can't see it.
+            for screen in app.screens():
+                if screen.availableGeometry().adjusted(
+                    -50, -50, 50, 50
+                ).contains(x, y):
+                    _window.move(x, y)
+                    restored = True
+                    break
+
+        if not restored:
+            # First-ever launch, or saved position is off-screen: fall
+            # back to positioning relative to the Blender window.
+            blender_rect = app.blender_widget.frameGeometry()
+
+            x = blender_rect.right() - _window.width() - 10
+            y = blender_rect.top() + 30
+
+            _window.move(x, y)
 
     else:
         # Window already exists (just hidden) - the active armature may

@@ -7,6 +7,7 @@ Displays circular picker controls on a free canvas.
 from PySide6.QtWidgets import (
     QWidget,
     QScrollArea,
+    QPushButton,
 )
 from PySide6.QtGui import (
     QPen,
@@ -14,7 +15,7 @@ from PySide6.QtGui import (
 )
 
 from .circle_control import CircleControl
-from PySide6.QtGui import QPixmap, QPainter, QImage, QPolygon
+from PySide6.QtGui import QPixmap, QPainter, QImage, QPolygon, QFontMetrics, QFont
 from PySide6.QtCore import Qt, QPoint, QRect
 
 
@@ -121,6 +122,7 @@ class ControlList(QScrollArea):
 
         self.container.apply_image_offset()
         self.container.layout_controls()
+        self.container.update_overlay_buttons()
         self.container.update()
 
     def clear_background(self):
@@ -136,6 +138,7 @@ class ControlList(QScrollArea):
         self.container.image_offset_y = 0.0
 
         self.container.layout_controls()
+        self.container.update_overlay_buttons()
         self.container.update()
 
 class PickerCanvas(QWidget):
@@ -149,6 +152,33 @@ class PickerCanvas(QWidget):
         # it's always safe to reference even before that happens.
         self.control_list = None
 
+       # IK/FK overlay buttons
+        self.ikfk_toggle_button = QPushButton("FK | IK", self)
+        self.fk_to_ik_button = QPushButton("FK → IK", self)
+        self.ik_to_fk_button = QPushButton("IK → FK", self)
+
+        for btn in (
+            self.ikfk_toggle_button,
+            self.fk_to_ik_button,
+            self.ik_to_fk_button,
+        ):
+            btn.setObjectName("ikfkOverlayButton")
+
+            btn.adjustSize()
+
+            btn._base_width = btn.width()
+            btn._base_height = btn.height()
+
+            f = btn.font()
+            if f.pixelSize() > 0:
+                btn._base_font_px = f.pixelSize()
+            else:
+                btn._base_font_px = round(
+                    f.pointSizeF() * self.logicalDpiY() / 72
+                )
+
+            btn.raise_()
+            btn.hide()
         # Background image position
         self.image_x = 0
         self.image_y = 0
@@ -171,6 +201,11 @@ class PickerCanvas(QWidget):
 
         self.symmetry_handle_size = 14
         self.symmetry_handle_hover = False
+    
+    def connect_controller(self, controller):
+        self.ikfk_toggle_button.clicked.connect(controller.toggle_ik_fk)
+        self.fk_to_ik_button.clicked.connect(controller.fk_to_ik)
+        self.ik_to_fk_button.clicked.connect(controller.ik_to_fk)
 
     def scaled_background(self):
         if self.background is None:
@@ -267,6 +302,108 @@ class PickerCanvas(QWidget):
         controller.save()
         self.layout_controls()
 
+    def fit_font(self, btn):
+        text = btn.text()
+
+        if not text:
+            return
+
+        # Margins scale with the button instead of being a flat 10px.
+        # A flat margin can exceed the entire button at small scales,
+        # meaning no size ever "fits" below - which is why the font used
+        # to get left stuck at whatever size it last was (too big for the
+        # new, smaller button) instead of shrinking with it.
+        width_margin = max(2, round(btn.width() * 0.12))
+        height_margin = max(2, round(btn.height() * 0.2))
+
+        available_width = max(4, btn.width() - width_margin)
+        available_height = max(4, btn.height() - height_margin)
+
+        font = QFont(btn.font())
+
+        # Absolute floor so a font is always applied, even for extremely
+        # small buttons where nothing fits perfectly - matches btn.setFont()
+        # always being called below instead of sometimes being skipped.
+        best_size = 4
+
+        size = max(4, int(btn.height() * 0.55))
+        while size >= 4:
+            font.setPixelSize(size)
+            metrics = QFontMetrics(font)
+
+            if (
+                metrics.horizontalAdvance(text) <= available_width
+                and metrics.height() <= available_height
+            ):
+                best_size = size
+                break
+
+            size -= 1
+
+        # Shrink slightly below the max-that-fits so there's always some
+        # visible breathing room between the text and the button border,
+        # instead of the text touching the edges.
+        best_size = max(4, round(best_size * 0.8))
+
+        font.setPixelSize(best_size)
+        btn.setFont(font)
+    def update_ikfk_toggle(self, is_fk):
+        self.ikfk_toggle_button.blockSignals(True)
+
+        self.ikfk_toggle_button.setChecked(is_fk)
+
+        if is_fk:
+            self.ikfk_toggle_button.setText("FK")
+        else:
+            self.ikfk_toggle_button.setText("IK")
+
+        self.fit_font(self.ikfk_toggle_button)
+
+        self.ikfk_toggle_button.blockSignals(False)
+
+
+    def update_overlay_buttons(self):
+
+        buttons = (
+            self.ikfk_toggle_button,
+            self.fk_to_ik_button,
+            self.ik_to_fk_button,
+        )
+
+        if self.background is None:
+            for btn in buttons:
+                btn.hide()
+            return
+
+        scale = self.image_scale()
+
+        # Slightly larger than picker controls
+        button_scale = max(0.1, scale) * 2.0
+        font_scale = max(0.1, scale) * 0.5
+
+        margin = round(10 * button_scale)
+        spacing = round(4 * button_scale)
+
+        x = self.image_x + margin
+        y = self.image_y + margin
+
+        for i, btn in enumerate(buttons):
+
+            width = max(8, round(btn._base_width * button_scale))
+            height = max(8, round(btn._base_height * button_scale))
+
+            btn.setFixedSize(width, height)
+            self.fit_font(btn)
+
+            
+
+            btn.move(
+                round(x),
+                round(y + i * (height + spacing))
+            )
+
+            btn.raise_()
+            btn.show()
     def paintEvent(self, event):
 
         super().paintEvent(event)
@@ -443,6 +580,7 @@ class PickerCanvas(QWidget):
                 )
 
             self.layout_controls()
+            self.update_overlay_buttons()
             self.update()
             return
 
@@ -510,6 +648,7 @@ class PickerCanvas(QWidget):
                 self.image_offset_y = (self.image_y - min_y) / available_y
 
             self.layout_controls()
+            self.update_overlay_buttons()
             self.update()
 
         super().mouseMoveEvent(event)
@@ -568,6 +707,7 @@ class PickerCanvas(QWidget):
         self.apply_image_offset()
 
         self.layout_controls()
+        self.update_overlay_buttons()
         self.update()
 
     def mouseReleaseEvent(self, event):

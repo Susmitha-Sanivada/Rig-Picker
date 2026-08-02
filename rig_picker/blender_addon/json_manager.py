@@ -140,6 +140,19 @@ def _load():
                 _data = {}
     else:
         _data = {}
+    
+    # --------------------------------------------------
+    # Ensure global settings always exist
+    # --------------------------------------------------
+
+    _data.setdefault("_settings", {})
+    _data["_settings"].setdefault(
+        "window",
+        {
+            "width": 360,
+            "height": 500,
+        },
+    )
 
     return _data
 
@@ -222,3 +235,59 @@ def delete_armature_data(armature_name):
     if armature_name in data:
         del data[armature_name]
         _flush()
+
+DEFAULT_WINDOW_WIDTH = 360
+DEFAULT_WINDOW_HEIGHT = 500
+
+
+def get_window_size():
+
+    data = _load()
+
+    settings = data.get("_settings", {})
+    window = settings.get("window", {})
+
+    return (
+        window.get("width", DEFAULT_WINDOW_WIDTH),
+        window.get("height", DEFAULT_WINDOW_HEIGHT),
+    )
+
+
+def save_window_size(width, height):
+
+    _load()
+
+    _data["_settings"]["window"]["width"] = int(width)
+    _data["_settings"]["window"]["height"] = int(height)
+
+    _flush()
+
+
+def get_window_position():
+    """Returns the saved (x, y) window position, or None if nothing has
+    been saved yet (e.g. first-ever launch) - callers should fall back to
+    their own default placement logic (e.g. relative to the Blender
+    window) in that case."""
+
+    data = _load()
+
+    settings = data.get("_settings", {})
+    window = settings.get("window", {})
+
+    x = window.get("x")
+    y = window.get("y")
+
+    if x is None or y is None:
+        return None
+
+    return (x, y)
+
+
+def save_window_position(x, y):
+
+    _load()
+
+    _data["_settings"]["window"]["x"] = int(x)
+    _data["_settings"]["window"]["y"] = int(y)
+
+    _flush()

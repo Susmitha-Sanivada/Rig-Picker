@@ -7,7 +7,6 @@ QWidget
     background: #2f2f2f;
     color: #d7d7d7;
     font-family: "Segoe UI";
-    font-size: 9pt;
 }
 
 /*--------------------------------------------------
@@ -45,6 +44,26 @@ QPushButton:disabled
 {
     background-color: #353535;
     color: #777777;
+}
+
+/*--------------------------------------------------
+    IK/FK Overlay Buttons
+
+    These are resized dynamically (setFixedSize) based on canvas zoom,
+    so they must NOT inherit the generic QPushButton's fixed
+    min-height/max-height/padding above - those would clamp the actual
+    rendered box while the widget still reports the larger requested
+    height, causing the fitted font to be sized for a box bigger than
+    what's actually drawn on screen (i.e. text overflow).
+--------------------------------------------------*/
+
+QPushButton#ikfkOverlayButton
+{
+    min-height: 0px;
+    max-height: 16777215px;
+    min-width: 0px;
+    max-width: 16777215px;
+    padding: 0px;
 }
 
 /*--------------------------------------------------

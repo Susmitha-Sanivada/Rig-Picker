@@ -14,6 +14,106 @@ import tempfile
 import bpy
 
 from .. import json_manager
+from .. import backend
+
+IK_FK_GROUPS = {
+
+    "upper_arm_parent.L": {
+        "output_bones": [
+            "upper_arm_fk.L",
+            "forearm_fk.L",
+            "hand_fk.L",
+        ],
+        "input_bones": [
+            "upper_arm_ik.L",
+            "MCH-forearm_ik.L",
+            "MCH-upper_arm_ik_target.L",
+        ],
+        "ctrl_bones": [
+            "upper_arm_ik.L",
+            "upper_arm_ik_target.L",
+            "hand_ik.L",
+        ],
+    },
+
+    "upper_arm_parent.R": {
+        "output_bones": [
+            "upper_arm_fk.R",
+            "forearm_fk.R",
+            "hand_fk.R",
+        ],
+        "input_bones": [
+            "upper_arm_ik.R",
+            "MCH-forearm_ik.R",
+            "MCH-upper_arm_ik_target.R",
+        ],
+        "ctrl_bones": [
+            "upper_arm_ik.R",
+            "upper_arm_ik_target.R",
+            "hand_ik.R",
+        ],
+    },
+    "thigh_parent.L": {
+        "output_bones": [
+            "thigh_fk.L",
+            "shin_fk.L",
+            "foot_fk.L",
+            "toe_fk.L",
+        ],
+        "input_bones": [
+            "thigh_ik.L",
+            "MCH-shin_ik.L",
+            "MCH-thigh_ik_target.L",
+        ],
+        "ctrl_bones": [
+            "thigh_ik.L",
+            "thigh_ik_target.L",
+            "foot_ik.L",
+        ],
+
+        "tail_bones": [
+            "toe_ik.L",
+        ],
+
+        "extra_ctrls": [
+            "foot_heel_ik.L",
+            "foot_spin_ik.L",
+        ],
+
+        "heel_control": "foot_heel_ik.L",
+    },
+    "thigh_parent.R": {
+        "output_bones": [
+            "thigh_fk.R",
+            "shin_fk.R",
+            "foot_fk.R",
+            "toe_fk.R",
+        ],
+
+        "input_bones": [
+            "thigh_ik.R",
+            "MCH-shin_ik.R",
+            "MCH-thigh_ik_target.R",
+        ],
+
+        "ctrl_bones": [
+            "thigh_ik.R",
+            "thigh_ik_target.R",
+            "foot_ik.R",
+        ],
+
+        "tail_bones": [
+            "toe_ik.R",
+        ],
+
+        "extra_ctrls": [
+            "foot_heel_ik.R",
+            "foot_spin_ik.R",
+        ],
+
+        "heel_control": "foot_heel_ik.R",
+    },
+}
 
 
 def refresh_3d_view(context):
@@ -431,3 +531,178 @@ class Controller:
         canvas.update()
 
         self.save()
+    def toggle_ik_fk(self):
+
+        if len(self.selected_bones) != 1:
+            return
+
+        selected_bone = next(iter(self.selected_bones))
+
+        parent_bone = None
+
+        for parent, group in IK_FK_GROUPS.items():
+
+            if (
+                selected_bone == parent
+                or selected_bone in group["output_bones"]
+                or selected_bone in group["input_bones"]
+                or selected_bone in group["ctrl_bones"]
+            ):
+                parent_bone = parent
+                break
+
+        if parent_bone is None:
+            return
+
+        rig = backend.arm()
+        if rig is None:
+            return
+
+        pb = rig.pose.bones.get(parent_bone)
+        if pb is None or "IK_FK" not in pb:
+            return
+
+        current = float(pb["IK_FK"])
+        pb["IK_FK"] = 0.0 if current >= 0.5 else 1.0
+
+        pb.keyframe_insert(
+            data_path='["IK_FK"]',
+            frame=bpy.context.scene.frame_current
+        )
+
+        rig.update_tag(refresh={'DATA'})
+        bpy.context.view_layer.update()
+
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                area.tag_redraw()
+    
+
+    def fk_to_ik(self):
+
+        if len(self.selected_bones) != 1:
+            return
+
+        selected_bone = next(iter(self.selected_bones))
+
+        parent_bone = None
+        group = None
+
+        for parent, data in IK_FK_GROUPS.items():
+            if (
+                selected_bone == parent
+                or selected_bone in data["output_bones"]
+                or selected_bone in data["input_bones"]
+                or selected_bone in data["ctrl_bones"]
+            ):
+                parent_bone = parent
+                group = data
+                break
+
+        if group is None:
+            return
+
+        rig = backend.arm()
+
+        bpy.context.view_layer.objects.active = rig
+        rig.select_set(True)
+
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type != "VIEW_3D":
+                    continue
+
+                for region in area.regions:
+                    if region.type != "WINDOW":
+                        continue
+
+                    with bpy.context.temp_override(
+                        window=window,
+                        area=area,
+                        region=region,
+                        active_object=rig,
+                        object=rig,
+                    ):
+
+                        bpy.ops.pose.rigify_generic_snap_oeujyfjmc8c1f286(
+                            output_bones=str(group["output_bones"]).replace("'", '"'),
+                            input_bones=str(group["input_bones"]).replace("'", '"'),
+                            ctrl_bones=str(group["ctrl_bones"]).replace("'", '"'),
+                            tooltip="FK to IK",
+                            locks=(False, False, False),
+                        )
+
+                        bpy.context.view_layer.update()
+
+                        for win in bpy.context.window_manager.windows:
+                            for ar in win.screen.areas:
+                                ar.tag_redraw()
+
+                        return
+
+
+    def ik_to_fk(self):
+
+        if len(self.selected_bones) != 1:
+            return
+
+        selected_bone = next(iter(self.selected_bones))
+
+        parent_bone = None
+        group = None
+
+        for parent, data in IK_FK_GROUPS.items():
+            if (
+                selected_bone == parent
+                or selected_bone in data["output_bones"]
+                or selected_bone in data["input_bones"]
+                or selected_bone in data["ctrl_bones"]
+            ):
+                parent_bone = parent
+                group = data
+                break
+
+        if group is None:
+            return
+
+        rig = backend.arm()
+
+        bpy.context.view_layer.objects.active = rig
+        rig.select_set(True)
+
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type != "VIEW_3D":
+                    continue
+
+                for region in area.regions:
+                    if region.type != "WINDOW":
+                        continue
+
+                    with bpy.context.temp_override(
+                        window=window,
+                        area=area,
+                        region=region,
+                        active_object=rig,
+                        object=rig,
+                    ):
+
+                        bpy.ops.pose.rigify_limb_ik2fk_oeujyfjmc8c1f286(
+                            prop_bone=parent_bone,
+                            pole_prop="pole_vector",
+
+                            fk_bones=str(group["output_bones"]).replace("'", '"'),
+                            ik_bones=str(group["input_bones"]).replace("'", '"'),
+                            ctrl_bones=str(group["ctrl_bones"]).replace("'", '"'),
+
+                            tail_bones=str(group.get("tail_bones", [])).replace("'", '"'),
+                            extra_ctrls=str(group.get("extra_ctrls", [])).replace("'", '"'),
+                        )
+
+                        bpy.context.view_layer.update()
+
+                        for win in bpy.context.window_manager.windows:
+                            for ar in win.screen.areas:
+                                ar.tag_redraw()
+
+                        return

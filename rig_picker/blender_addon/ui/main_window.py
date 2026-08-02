@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QCheckBox
 )
-from PySide6.QtCore import Qt, QPoint, QRectF
+from PySide6.QtCore import Qt, QPoint, QRectF, QTimer
 from PySide6.QtGui import QPainterPath, QRegion
 
 from .control_list import ControlList
@@ -72,13 +72,28 @@ class RigPickerWindow(QMainWindow):
             self.setStyleSheet(f.read())
 
         self.setWindowTitle("Rig Picker")
-        self.resize(360, 500)
         self.setMinimumSize(360, 500)
 
         self.controller = Controller()
         self.controller.set_window(self)
 
+        # Created before build_ui()/resize() below, since either of those
+        # can trigger resizeEvent()/moveEvent() - which reference these
+        # timers - before the window is ever shown.
+        self.resize_timer = QTimer(self)
+        self.resize_timer.setSingleShot(True)
+        self.resize_timer.timeout.connect(self.save_window_size)
+
+        self.move_timer = QTimer(self)
+        self.move_timer.setSingleShot(True)
+        self.move_timer.timeout.connect(self.save_window_position)
+
         self.build_ui()
+        from .. import json_manager
+
+        width, height = json_manager.get_window_size()
+
+        self.resize(width, height)
 
         # Make this the addon's single active controller, so the
         # depsgraph handler in backend.py can refresh it automatically
@@ -251,6 +266,7 @@ class RigPickerWindow(QMainWindow):
         self.control_list = ControlList()
 
         layout.addWidget(self.control_list)
+        self.control_list.container.connect_controller(self.controller)
 
         # ----------------------------------------------------
         # Connections
@@ -356,3 +372,42 @@ class RigPickerWindow(QMainWindow):
         self.clearFocus()
 
         super().leaveEvent(event)
+    
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.resize_timer.start(200)
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self.move_timer.start(200)
+
+    def closeEvent(self, event):
+        # Save the window's current size and position the moment the
+        # picker is closed - unconditionally, not just when a resize/move
+        # debounce timer happens to still be pending. This guarantees the
+        # state on disk is up to date as soon as the UI window closes,
+        # rather than only ending up correct incidentally (e.g. whenever
+        # the .blend file is next saved).
+        self.resize_timer.stop()
+        self.move_timer.stop()
+
+        self.save_window_size()
+        self.save_window_position()
+
+        super().closeEvent(event)
+
+    def save_window_size(self):
+        from .. import json_manager
+
+        json_manager.save_window_size(
+            self.width(),
+            self.height(),
+        )
+
+    def save_window_position(self):
+        from .. import json_manager
+
+        json_manager.save_window_position(
+            self.x(),
+            self.y(),
+        )
