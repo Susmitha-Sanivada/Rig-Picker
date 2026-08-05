@@ -156,11 +156,15 @@ class PickerCanvas(QWidget):
         self.ikfk_toggle_button = QPushButton("FK | IK", self)
         self.fk_to_ik_button = QPushButton("FK → IK", self)
         self.ik_to_fk_button = QPushButton("IK → FK", self)
+        self.calculate_path_button = QPushButton("Calculate", self)
+        self.clear_path_button = QPushButton("x", self)
 
         for btn in (
             self.ikfk_toggle_button,
             self.fk_to_ik_button,
             self.ik_to_fk_button,
+            self.calculate_path_button,
+            self.clear_path_button,
         ):
             btn.setObjectName("ikfkOverlayButton")
 
@@ -206,6 +210,8 @@ class PickerCanvas(QWidget):
         self.ikfk_toggle_button.clicked.connect(controller.toggle_ik_fk)
         self.fk_to_ik_button.clicked.connect(controller.fk_to_ik)
         self.ik_to_fk_button.clicked.connect(controller.ik_to_fk)
+        self.calculate_path_button.clicked.connect(controller.calculate_motion_path)
+        self.clear_path_button.clicked.connect(controller.clear_motion_path)
 
     def scaled_background(self):
         if self.background is None:
@@ -348,14 +354,24 @@ class PickerCanvas(QWidget):
         font.setPixelSize(best_size)
         btn.setFont(font)
     def update_ikfk_toggle(self, is_fk):
+        """is_fk: True if the selected bone is currently in FK, False if
+        currently in IK, or None if there's no single selected bone
+        belonging to an IK/FK group. The button always shows the state
+        it will switch TO if clicked, not the current state - so it's
+        never ambiguous which way it's about to flip."""
         self.ikfk_toggle_button.blockSignals(True)
 
-        self.ikfk_toggle_button.setChecked(is_fk)
-
-        if is_fk:
-            self.ikfk_toggle_button.setText("FK")
+        if is_fk is None:
+            self.ikfk_toggle_button.setChecked(False)
+            self.ikfk_toggle_button.setText("FK | IK")
+        elif is_fk:
+            # Currently FK -> clicking switches TO IK
+            self.ikfk_toggle_button.setChecked(True)
+            self.ikfk_toggle_button.setText("\u2192IK")
         else:
-            self.ikfk_toggle_button.setText("IK")
+            # Currently IK -> clicking switches TO FK
+            self.ikfk_toggle_button.setChecked(False)
+            self.ikfk_toggle_button.setText("\u2192FK")
 
         self.fit_font(self.ikfk_toggle_button)
 
@@ -364,14 +380,19 @@ class PickerCanvas(QWidget):
 
     def update_overlay_buttons(self):
 
-        buttons = (
-            self.ikfk_toggle_button,
-            self.fk_to_ik_button,
-            self.ik_to_fk_button,
+        # Each entry is a row; a row with more than one button lays them
+        # out side by side instead of stacking them.
+        rows = (
+            (self.ikfk_toggle_button,),
+            (self.fk_to_ik_button,),
+            (self.ik_to_fk_button,),
+            (self.calculate_path_button, self.clear_path_button),
         )
 
+        all_buttons = [btn for row in rows for btn in row]
+
         if self.background is None:
-            for btn in buttons:
+            for btn in all_buttons:
                 btn.hide()
             return
 
@@ -387,23 +408,29 @@ class PickerCanvas(QWidget):
         x = self.image_x + margin
         y = self.image_y + margin
 
-        for i, btn in enumerate(buttons):
+        for row in rows:
 
-            width = max(8, round(btn._base_width * button_scale))
-            height = max(8, round(btn._base_height * button_scale))
+            row_x = x
+            row_height = 0
 
-            btn.setFixedSize(width, height)
-            self.fit_font(btn)
+            for btn in row:
 
-            
+                width = max(8, round(btn._base_width * button_scale))
+                height = max(8, round(btn._base_height * button_scale))
 
-            btn.move(
-                round(x),
-                round(y + i * (height + spacing))
-            )
+                btn.setFixedSize(width, height)
+                self.fit_font(btn)
 
-            btn.raise_()
-            btn.show()
+                btn.move(round(row_x), round(y))
+
+                btn.raise_()
+                btn.show()
+
+                row_x += width + spacing
+                row_height = max(row_height, height)
+
+            y += row_height + spacing
+
     def paintEvent(self, event):
 
         super().paintEvent(event)

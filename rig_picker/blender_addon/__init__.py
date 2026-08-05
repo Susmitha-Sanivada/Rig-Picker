@@ -22,6 +22,8 @@ from .backend import (
     RP_OT_ShowAll,
     RP_OT_HideAll,
     RP_OT_CaptureView,
+    RP_OT_CalculatePath,
+    RP_OT_ClearPath,
 )
 
 classes = (
@@ -31,6 +33,8 @@ classes = (
     RP_OT_ShowAll,
     RP_OT_HideAll,
     RP_OT_CaptureView,
+    RP_OT_CalculatePath,
+    RP_OT_ClearPath,
 
     RP_PT_MainPanel,
 )

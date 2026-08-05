@@ -183,6 +183,41 @@ class Controller:
             None,
         )
 
+    def refresh_ikfk_label(self):
+        """Updates the IK/FK toggle button to show the state it will
+        switch TO if clicked (e.g. "->IK" while currently in FK), based
+        on the currently selected bone's live IK_FK property. Shows a
+        neutral label when there's no single selected bone that belongs
+        to an IK/FK group.
+        """
+        if self.window is None:
+            return
+
+        is_fk = None
+
+        if len(self.selected_bones) == 1:
+            selected_bone = next(iter(self.selected_bones))
+
+            for parent, group in IK_FK_GROUPS.items():
+                if (
+                    selected_bone == parent
+                    or selected_bone in group["output_bones"]
+                    or selected_bone in group["input_bones"]
+                    or selected_bone in group["ctrl_bones"]
+                ):
+                    rig = backend.arm()
+
+                    if rig is not None:
+                        pb = rig.pose.bones.get(parent)
+
+                        if pb is not None and "IK_FK" in pb:
+                            # Rigify convention: 0.0 = IK, 1.0 = FK
+                            is_fk = float(pb["IK_FK"]) >= 0.5
+
+                    break
+
+        self.window.control_list.container.update_ikfk_toggle(is_fk)
+
     # ---------------------------------------------------------
 
     def refresh(self):
@@ -234,6 +269,8 @@ class Controller:
 
         self.window.control_list.container.layout_controls()
         self.window.control_list.container.update()
+
+        self.refresh_ikfk_label()
 
     # ---------------------------------------------------------
 
@@ -307,6 +344,8 @@ class Controller:
             bone_name=bone_name,
             shift=shift
         )
+
+        self.refresh_ikfk_label()
 
     def set_selected_size(self, size):
         self._set_selected_appearance(size=size)
@@ -389,6 +428,18 @@ class Controller:
         # Update control positions once in case size changed
         self.window.control_list.container.layout_controls()
         self.save()
+
+    def calculate_motion_path(self):
+        if not self.selected_bones:
+            return
+
+        bpy.ops.rp.calculate_path()
+
+    def clear_motion_path(self):
+        if not self.selected_bones:
+            return
+
+        bpy.ops.rp.clear_path()
 
     def show_all(self):
         bpy.ops.rp.show_all()
@@ -494,6 +545,8 @@ class Controller:
                     item["control_color"],
                 )
 
+        self.refresh_ikfk_label()
+
     def deselect_all(self):
         self.selected_bones.clear()
 
@@ -516,6 +569,8 @@ class Controller:
 
             # Refresh 3D Viewport immediately
             refresh_3d_view(bpy.context)
+
+        self.refresh_ikfk_label()
 
     def toggle_symmetry(self, enabled):
         self.data["symmetry"] = enabled
@@ -576,6 +631,8 @@ class Controller:
         for window in bpy.context.window_manager.windows:
             for area in window.screen.areas:
                 area.tag_redraw()
+
+        self.refresh_ikfk_label()
     
 
     def fk_to_ik(self):
@@ -638,6 +695,7 @@ class Controller:
                             for ar in win.screen.areas:
                                 ar.tag_redraw()
 
+                        self.refresh_ikfk_label()
                         return
 
 
@@ -705,4 +763,5 @@ class Controller:
                             for ar in win.screen.areas:
                                 ar.tag_redraw()
 
+                        self.refresh_ikfk_label()
                         return

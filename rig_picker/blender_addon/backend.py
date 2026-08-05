@@ -271,6 +271,70 @@ class RP_OT_HideAll(bpy.types.Operator):
 
 
 # ---------------------------------------------------------
+# CALCULATE MOTION PATH
+# ---------------------------------------------------------
+
+class RP_OT_CalculatePath(bpy.types.Operator):
+    bl_idname = "rp.calculate_path"
+    bl_label = "Calculate Motion Path"
+
+    def execute(self, context):
+        rig = arm()
+        if not rig:
+            return {'CANCELLED'}
+
+        override = get_3d_override(context, rig)
+        if not override:
+            return {'CANCELLED'}
+
+        with context.temp_override(**override):
+            context.view_layer.objects.active = rig
+            ensure_pose_mode(context, rig)
+
+            selected = [pb for pb in rig.pose.bones if pb.select]
+            if not selected:
+                return {'CANCELLED'}
+
+            # Uses Blender's own "Calculate Motion Paths" behavior, which
+            # operates on whichever pose bones are currently selected -
+            # the picker keeps that selection in sync with the controls
+            # selected in the picker UI, so this just piggybacks on it.
+            bpy.ops.pose.paths_calculate()
+
+        refresh_3d_view(context)
+        return {'FINISHED'}
+
+
+class RP_OT_ClearPath(bpy.types.Operator):
+    bl_idname = "rp.clear_path"
+    bl_label = "Clear Motion Path"
+
+    def execute(self, context):
+        rig = arm()
+        if not rig:
+            return {'CANCELLED'}
+
+        override = get_3d_override(context, rig)
+        if not override:
+            return {'CANCELLED'}
+
+        with context.temp_override(**override):
+            context.view_layer.objects.active = rig
+            ensure_pose_mode(context, rig)
+
+            selected = [pb for pb in rig.pose.bones if pb.select]
+            if not selected:
+                return {'CANCELLED'}
+
+            # Only clear paths for the bone(s) behind the currently
+            # selected control(s) - not every calculated path on the rig.
+            bpy.ops.pose.paths_clear(only_selected=True)
+
+        refresh_3d_view(context)
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------
 # CAPTURE VIEW
 # ---------------------------------------------------------
 
