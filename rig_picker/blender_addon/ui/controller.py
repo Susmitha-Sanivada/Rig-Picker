@@ -139,6 +139,36 @@ class Controller:
     # ARMATURE SWITCHING
     # ---------------------------------------------------------
 
+    def _sync_armature_combo_items(self):
+        """Keeps the dropdown's list of choices in sync with the actual
+        armatures in the scene.
+
+        The combo is only populated once at window-creation time
+        (main_window.py), so an armature added to the scene afterwards -
+        or renamed/deleted - was never reflected as a selectable entry,
+        even though everything else in the picker (controls, data, etc.)
+        updates fine. Blocks signals while rebuilding so this never
+        re-triggers change_armature().
+        """
+        if self.window is None:
+            return
+
+        combo = self.window.armature_combo
+
+        current_items = {combo.itemText(i) for i in range(combo.count())}
+        scene_armatures = {
+            obj.name for obj in bpy.data.objects if obj.type == "ARMATURE"
+        }
+
+        if current_items == scene_armatures:
+            return
+
+        combo.blockSignals(True)
+        combo.clear()
+        for name in sorted(scene_armatures):
+            combo.addItem(name)
+        combo.blockSignals(False)
+
     def load_armature(self, rig):
         """Saves the current picker to JSON, then loads the given armature's
         picker (or a blank one) from JSON and refreshes the UI."""
@@ -162,6 +192,8 @@ class Controller:
             self.window.size_combo.setEnabled(False)
             self.window.shape_combo.setEnabled(False)
             self.window.color_combo.setEnabled(False)
+
+            self._sync_armature_combo_items()
 
             # Keep the dropdown's displayed text in sync when the active
             # armature changes from outside the combo itself (e.g. clicking
@@ -208,38 +240,75 @@ class Controller:
             None,
         )
 
+    def _resolve_ikfk_group(self):
+        """Resolves the single IK/FK group that ALL of self.selected_bones
+        belong to.
+
+        Shift-selecting several controls that are all part of the same
+        limb (e.g. upper_arm_fk.L + forearm_fk.L, both under the
+        "upper_arm_parent.L" group) should still be treated as one valid
+        selection for IK/FK purposes - the old code only ever looked at
+        the selection when it contained exactly one bone, so snapping
+        silently did nothing the moment a second control was shift-added.
+
+        Returns (parent_bone_name, group_dict) if every selected bone
+        resolves to the same group, otherwise (None, None) - e.g. when
+        nothing is selected, a selected bone isn't part of any IK/FK
+        group, or the selection spans two different groups (which has no
+        single well-defined snap target).
+        """
+        if not self.selected_bones:
+            return None, None
+
+        resolved_parents = set()
+
+        for bone in self.selected_bones:
+            match = None
+
+            for parent, group in IK_FK_GROUPS.items():
+                if (
+                    bone == parent
+                    or bone in group["output_bones"]
+                    or bone in group["input_bones"]
+                    or bone in group["ctrl_bones"]
+                ):
+                    match = parent
+                    break
+
+            if match is None:
+                return None, None
+
+            resolved_parents.add(match)
+
+        if len(resolved_parents) != 1:
+            return None, None
+
+        parent = next(iter(resolved_parents))
+        return parent, IK_FK_GROUPS[parent]
+
     def refresh_ikfk_label(self):
         """Updates the IK/FK toggle button to show the state it will
         switch TO if clicked (e.g. "->IK" while currently in FK), based
-        on the currently selected bone's live IK_FK property. Shows a
-        neutral label when there's no single selected bone that belongs
-        to an IK/FK group.
+        on the currently selected control(s)' live IK_FK property. Shows a
+        neutral label when the current selection doesn't resolve to a
+        single IK/FK group.
         """
         if self.window is None:
             return
 
         is_fk = None
 
-        if len(self.selected_bones) == 1:
-            selected_bone = next(iter(self.selected_bones))
+        parent_bone, group = self._resolve_ikfk_group()
 
-            for parent, group in IK_FK_GROUPS.items():
-                if (
-                    selected_bone == parent
-                    or selected_bone in group["output_bones"]
-                    or selected_bone in group["input_bones"]
-                    or selected_bone in group["ctrl_bones"]
-                ):
-                    rig = backend.arm()
+        if parent_bone is not None:
+            rig = backend.arm()
 
-                    if rig is not None:
-                        pb = rig.pose.bones.get(parent)
+            if rig is not None:
+                pb = rig.pose.bones.get(parent_bone)
 
-                        if pb is not None and "IK_FK" in pb:
-                            # Rigify convention: 0.0 = IK, 1.0 = FK
-                            is_fk = float(pb["IK_FK"]) >= 0.5
-
-                    break
+                if pb is not None and "IK_FK" in pb:
+                    # Rigify convention: 0.0 = IK, 1.0 = FK
+                    is_fk = float(pb["IK_FK"]) >= 0.5
 
         self.window.control_list.container.update_ikfk_toggle(is_fk)
 
@@ -397,6 +466,58 @@ class Controller:
             bone_name=bone_name,
             shift=shift
         )
+
+        self.refresh_ikfk_label()
+
+    def sync_selection_from_blender(self, selected_bone_names):
+        """Called from backend.poll_active_armature when the set of
+        selected pose bones changes in the 3D viewport (i.e. the user
+        selected a control directly in Blender, not by clicking it in the
+        picker UI).
+
+        Only bones that are actually registered as controls in the current
+        picker are reflected in the UI. If none of the newly-selected
+        bones are picker controls, the UI is left exactly as it was -
+        nothing happens.
+
+        This never calls back into bpy.ops.rp.select: the bones are
+        already selected in Blender (that's what triggered this in the
+        first place), so this only needs to update the Qt widgets/state.
+        """
+        if self.window is None:
+            return
+
+        added_bones = {item["bone_name"] for item in self.data["items"]}
+
+        new_selection = set(selected_bone_names) & added_bones
+
+        if not new_selection:
+            # None of the selected bones are added controls - leave the
+            # picker UI's current selection untouched.
+            return
+
+        if new_selection == self.selected_bones:
+            return
+
+        self.selected_bones = new_selection
+
+        for name, widget in self.window.control_list.controls.items():
+            widget.active = (name in self.selected_bones)
+            widget.update()
+
+        first = next(iter(self.selected_bones))
+        item = self.find_item(first)
+
+        if item:
+            self.window.set_selected_control(
+                item["control_size"],
+                item["control_shape"],
+                item["control_color"],
+            )
+
+        self.window.size_combo.setEnabled(True)
+        self.window.shape_combo.setEnabled(True)
+        self.window.color_combo.setEnabled(True)
 
         self.refresh_ikfk_label()
 
@@ -677,23 +798,7 @@ class Controller:
         self.save()
     def toggle_ik_fk(self):
 
-        if len(self.selected_bones) != 1:
-            return
-
-        selected_bone = next(iter(self.selected_bones))
-
-        parent_bone = None
-
-        for parent, group in IK_FK_GROUPS.items():
-
-            if (
-                selected_bone == parent
-                or selected_bone in group["output_bones"]
-                or selected_bone in group["input_bones"]
-                or selected_bone in group["ctrl_bones"]
-            ):
-                parent_bone = parent
-                break
+        parent_bone, group = self._resolve_ikfk_group()
 
         if parent_bone is None:
             return
@@ -726,24 +831,7 @@ class Controller:
 
     def fk_to_ik(self):
 
-        if len(self.selected_bones) != 1:
-            return
-
-        selected_bone = next(iter(self.selected_bones))
-
-        parent_bone = None
-        group = None
-
-        for parent, data in IK_FK_GROUPS.items():
-            if (
-                selected_bone == parent
-                or selected_bone in data["output_bones"]
-                or selected_bone in data["input_bones"]
-                or selected_bone in data["ctrl_bones"]
-            ):
-                parent_bone = parent
-                group = data
-                break
+        parent_bone, group = self._resolve_ikfk_group()
 
         if group is None:
             return
@@ -790,24 +878,7 @@ class Controller:
 
     def ik_to_fk(self):
 
-        if len(self.selected_bones) != 1:
-            return
-
-        selected_bone = next(iter(self.selected_bones))
-
-        parent_bone = None
-        group = None
-
-        for parent, data in IK_FK_GROUPS.items():
-            if (
-                selected_bone == parent
-                or selected_bone in data["output_bones"]
-                or selected_bone in data["input_bones"]
-                or selected_bone in data["ctrl_bones"]
-            ):
-                parent_bone = parent
-                group = data
-                break
+        parent_bone, group = self._resolve_ikfk_group()
 
         if group is None:
             return

@@ -195,8 +195,17 @@ class PickerCanvas(QWidget):
         # button did.
         self.ikfk_label_left = QLabel("IK", self)
         self.ikfk_label_left.setObjectName("ikfkOverlayLabel")
+        # Right-align "IK" so, once fit_font's breathing-room shrink
+        # leaves its glyph smaller than its own box, the leftover empty
+        # space sits on the outer/left side of the label instead of
+        # between the text and the switch (QLabel default-aligns left).
+        self.ikfk_label_left.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.ikfk_label_right = QLabel("FK", self)
         self.ikfk_label_right.setObjectName("ikfkOverlayLabel")
+        # Left-align (the QLabel default, set explicitly for clarity) so
+        # "FK"'s glyph hugs the switch on its left, with any leftover
+        # empty space on the outer/right side of the label instead.
+        self.ikfk_label_right.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.ikfk_switch = ToggleSwitch(checked=False, parent=self)
 
         # Neutral until a bone with a live IK_FK state is selected -
@@ -459,9 +468,10 @@ class PickerCanvas(QWidget):
         spacing = round(4 * button_scale)
 
         # The IK/FK switch and its two flanking labels read as one
-        # compound control, not three separate ones - so they sit much
-        # closer together than the spacing between separate buttons.
-        tight_spacing = round(-3 * button_scale)
+        # compound control, not three separate ones - so they sit flush
+        # against each other with no gap, unlike the spacing between
+        # separate buttons.
+        tight_spacing = 0
         tight_rows = (self.ikfk_label_left, self.ikfk_switch, self.ikfk_label_right)
 
         x = self.image_x + margin
@@ -470,9 +480,12 @@ class PickerCanvas(QWidget):
         for row in rows:
 
             row_x = x
-            row_height = 0
             row_spacing = tight_spacing if row == tight_rows else spacing
 
+            # First pass: resize every widget in the row (and fit its
+            # font, where applicable) so we know the row's tallest
+            # widget before positioning anything.
+            sizes = []
             for btn in row:
 
                 width = max(8, round(btn._base_width * button_scale))
@@ -486,13 +499,36 @@ class PickerCanvas(QWidget):
                 if hasattr(btn, "text"):
                     self.fit_font(btn)
 
-                btn.move(round(row_x), round(y))
+                # The label's box width comes from adjustSize() at
+                # construction time and doesn't shrink back down after
+                # fit_font() picks a smaller font for breathing room -
+                # so for the IK/switch/FK compound specifically, ask Qt
+                # to recompute the label's ideal box for its now-fitted
+                # font (instead of hand-measuring it, which can clip
+                # the text if the measurement comes out too tight).
+                if row == tight_rows and isinstance(btn, QLabel):
+                    btn.adjustSize()
+                    width = btn.width()
+                    height = btn.height()
+
+                sizes.append((width, height))
+
+            row_height = max(height for _, height in sizes)
+
+            # Second pass: position each widget, vertically centering it
+            # within the row so shorter widgets (e.g. the toggle switch)
+            # line up with taller ones (e.g. its flanking labels) instead
+            # of sharing a common top edge.
+            for btn, (width, height) in zip(row, sizes):
+
+                btn_y = y + (row_height - height) // 2
+
+                btn.move(round(row_x), round(btn_y))
 
                 btn.raise_()
                 btn.show()
 
                 row_x += width + row_spacing
-                row_height = max(row_height, height)
 
             y += row_height + spacing
 

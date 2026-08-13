@@ -16,6 +16,11 @@ _CACHED_ARM_NAME: str | None = None
 _ACTIVE_CONTROLLER = None
 _ACTIVE_WINDOW = None
 
+# Names of the pose bones that were selected the last time we checked.
+# Used to detect selections made directly in the 3D viewport (rather than
+# by clicking a control in the picker UI) so the UI can be kept in sync.
+_LAST_SELECTED_BONES: frozenset[str] = frozenset()
+
 # How often (seconds) to check whether a different armature has become
 # active. Selecting an object in the viewport doesn't always run
 # depsgraph_update_post - that handler is meant for actual data changes
@@ -46,15 +51,19 @@ def poll_active_armature():
     """Runs every _POLL_INTERVAL seconds via bpy.app.timers.
 
     Detects when a different armature has become active (in either Object
-    Mode or Pose Mode) and reloads the picker for it. Registered with
-    persistent=True in register(), so it keeps running across File > Open
-    without needing to be re-registered.
+    Mode or Pose Mode) and reloads the picker for it. Also detects when the
+    set of *selected pose bones* changes - e.g. the user clicking a control
+    directly in the 3D viewport instead of in the picker UI - and pushes
+    that selection into the Qt UI so the two stay in sync.
+
+    Registered with persistent=True in register(), so it keeps running
+    across File > Open without needing to be re-registered.
 
     Unlike depsgraph_update_post, a timer callback isn't a restricted
     context, so the reload can happen directly here - no need to defer it
     another tick.
     """
-    global _CACHED_ARM, _CACHED_ARM_NAME
+    global _CACHED_ARM, _CACHED_ARM_NAME, _LAST_SELECTED_BONES
 
     try:
         obj = getattr(bpy.context, "active_object", None)
@@ -66,6 +75,10 @@ def poll_active_armature():
                 _CACHED_ARM = obj
                 _CACHED_ARM_NAME = obj.name
 
+                # New armature - forget the previous armature's selection
+                # so a stale comparison doesn't suppress the first sync.
+                _LAST_SELECTED_BONES = frozenset()
+
                 if _ACTIVE_CONTROLLER is not None:
                     try:
                         _ACTIVE_CONTROLLER.load_armature(obj)
@@ -75,6 +88,30 @@ def poll_active_armature():
             else:
                 # Same armature logically; keep the reference fresh.
                 _CACHED_ARM = obj
+
+            # ----------------------------------------------------
+            # Detect pose-bone selection made in the 3D viewport and
+            # reflect it in the picker UI.
+            # ----------------------------------------------------
+            if obj.pose is not None:
+                current_selected = frozenset(
+                    pb.name for pb in obj.pose.bones if pb.select
+                )
+
+                if current_selected != _LAST_SELECTED_BONES:
+                    _LAST_SELECTED_BONES = current_selected
+
+                    if _ACTIVE_CONTROLLER is not None:
+                        try:
+                            _ACTIVE_CONTROLLER.sync_selection_from_blender(
+                                current_selected
+                            )
+                        except Exception:
+                            import traceback
+                            traceback.print_exc()
+        else:
+            # No active armature - nothing to compare selection against.
+            _LAST_SELECTED_BONES = frozenset()
 
     except Exception:
         import traceback

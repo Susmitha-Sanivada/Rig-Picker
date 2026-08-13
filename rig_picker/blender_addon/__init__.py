@@ -59,6 +59,7 @@ def register():
     backend._ACTIVE_WINDOW = None
     backend._CACHED_ARM = None
     backend._CACHED_ARM_NAME = None
+    backend._LAST_SELECTED_BONES = frozenset()
 
     # Force a fresh read of rig_picker_data.json from disk rather than
     # trusting an in-memory cache that may be stale after a file reload.

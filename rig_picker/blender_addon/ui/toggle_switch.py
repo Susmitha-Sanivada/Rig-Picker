@@ -30,7 +30,7 @@ class ToggleSwitch(QWidget):
         self._checked = checked
         self._knob_pos = 1.0 if checked else 0.0
 
-        self.setFixedSize(40, 20)
+        self.setFixedSize(32, 16)
         self.setCursor(Qt.PointingHandCursor)
 
         # Animates the knob sliding across, rather than snapping instantly,
