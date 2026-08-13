@@ -1,9 +1,8 @@
 """
 circle_control.py
 
-Professional anti-aliased picker control with flat solid fills.
-Selected controls invert to sleek dark charcoal gray (RGB 51, 51, 51) with a thin crisp white border,
-and revert to their normal base color when deselected.
+Professional anti-aliased picker control with solid (flat) colors,
+dynamic selection sizing, and crisp vector path borders.
 """
 
 from PySide6.QtCore import Qt, QPoint, Signal, QRectF, QPointF
@@ -22,7 +21,7 @@ class CircleControl(QWidget):
 
     clicked = Signal(str, bool)
 
-    # Standard studio palette
+    # Slightly brightened studio palette
     COLORS = {
         "RED": QColor(185, 55, 55),      # Crimson
         "GREEN": QColor(58, 142, 88),    # Emerald Green
@@ -76,10 +75,10 @@ class CircleControl(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
 
-        # Base padding reserved for borders and scaling
+        # Base padding reserved for strokes and hover scaling
         base_padding = max(3.0, 4.0 * self.display_scale)
 
-        # Dynamic Selection Sizing: slightly larger when active
+        # Dynamic Selection Sizing: pop out slightly larger when active
         if self.active:
             padding = base_padding * 0.4
         else:
@@ -117,25 +116,31 @@ class CircleControl(QWidget):
         join_style = Qt.MiterJoin if self.shape == "TRIANGLE" else Qt.RoundJoin
 
         # -------------------------------
-        # Selection vs Default Rendering
+        # Selection vs Default Rendering (Solid Colors)
         # -------------------------------
         if self.active:
-            # ACTIVE STATE: Dark Charcoal Fill (RGB 51, 51, 51 / #333333)
-            charcoal_fill = QColor(51, 51, 51)
+            # ACTIVE STATE: Solid brighter fill
+            fill_color = base_color.lighter(135)
 
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(charcoal_fill))
+            painter.setBrush(QBrush(fill_color))
             painter.drawPath(path)
 
-            # Thin crisp white border
-            white_border_pen = QPen(QColor(255, 255, 255), max(1.0, 1.2 * self.display_scale))
-            white_border_pen.setJoinStyle(join_style)
-            painter.setPen(white_border_pen)
+            # Vibrant inner accent ring
+            ring_pen = QPen(base_color.lighter(180), max(2.0, 2.5 * self.display_scale))
+            ring_pen.setJoinStyle(join_style)
+            painter.setPen(ring_pen)
             painter.setBrush(Qt.NoBrush)
             painter.drawPath(path)
 
+            # Solid dark outer boundary line
+            outer_pen = QPen(QColor(10, 10, 10, 240), max(1.0, 1.2 * self.display_scale))
+            outer_pen.setJoinStyle(join_style)
+            painter.setPen(outer_pen)
+            painter.drawPath(path)
+
         else:
-            # UNSELECTED STATE: Normal Base Color Fill
+            # UNSELECTED STATE: Solid even fill
             if self.dragging:
                 fill_color = base_color.darker(130)
             elif self.hover:
@@ -147,7 +152,7 @@ class CircleControl(QWidget):
             painter.setBrush(QBrush(fill_color))
             painter.drawPath(path)
 
-            # Dark outline stroke
+            # Solid dark outline
             border_pen = QPen(QColor(15, 15, 15, 200), max(1.0, 1.2 * self.display_scale))
             border_pen.setJoinStyle(join_style)
             painter.setPen(border_pen)

@@ -25,6 +25,7 @@ from .controller import Controller
 from .flow_layout import FlowLayout
 
 from pathlib import Path
+import bpy
 
 
 class PickerComboBox(QComboBox):
@@ -126,6 +127,12 @@ class RigPickerWindow(QMainWindow):
 
         toolbar = FlowLayout()
 
+        self.armature_combo = PickerComboBox()
+        self.armature_combo.setObjectName("pickerCombo")
+        for obj in bpy.data.objects:
+            if obj.type == "ARMATURE":
+                self.armature_combo.addItem(obj.name)
+
         self.capture_button = QPushButton("Capture View")
         self.add_button = QPushButton("Add Selected")
         self.clear_button = QPushButton("Clear All")
@@ -159,6 +166,7 @@ class RigPickerWindow(QMainWindow):
         self.shape_combo.setEnabled(False)
         self.color_combo.setEnabled(False)
 
+        toolbar.addWidget(self.armature_combo)
         toolbar.addWidget(self.capture_button)
         toolbar.addWidget(self.add_button)
         toolbar.addWidget(self.clear_button)
@@ -185,7 +193,15 @@ class RigPickerWindow(QMainWindow):
         selection_row.addWidget(size_field)
 
         self.symmetry_checkbox = QCheckBox("Symmetry")
-        layout.addWidget(self.symmetry_checkbox)
+        self.ik_fk_checkbox = QCheckBox("IK-FK")
+        self.motion_paths_checkbox = QCheckBox("Motion Paths")
+        checkbox_row = QHBoxLayout()
+        checkbox_row.setContentsMargins(0, 0, 0, 0)
+        checkbox_row.addWidget(self.symmetry_checkbox)
+        checkbox_row.addWidget(self.ik_fk_checkbox)
+        checkbox_row.addWidget(self.motion_paths_checkbox)
+        checkbox_row.addStretch()
+        layout.addLayout(checkbox_row)
 
         selection_row.addSpacing(8)
 
@@ -249,12 +265,15 @@ class RigPickerWindow(QMainWindow):
                 selection-color: white;
             }
         """
+        self.armature_combo.setFixedWidth(180)
         self.size_combo.setFixedWidth(74)
         self.shape_combo.setFixedWidth(100)
         self.color_combo.setFixedWidth(84)
+        self.armature_combo.setFixedHeight(24)
         self.size_combo.setFixedHeight(24)
         self.shape_combo.setFixedHeight(24)
         self.color_combo.setFixedHeight(24)
+        self.armature_combo.setStyleSheet(combo_style)
         self.size_combo.setStyleSheet(combo_style)
         self.shape_combo.setStyleSheet(combo_style)
         self.color_combo.setStyleSheet(combo_style)
@@ -271,6 +290,10 @@ class RigPickerWindow(QMainWindow):
         # ----------------------------------------------------
         # Connections
         # ----------------------------------------------------
+
+        self.armature_combo.currentTextChanged.connect(
+            self.controller.change_armature
+        )
 
         self.capture_button.clicked.connect(
             self.controller.capture_view
@@ -306,6 +329,14 @@ class RigPickerWindow(QMainWindow):
 
         self.symmetry_checkbox.toggled.connect(
             self.controller.toggle_symmetry
+        )
+
+        self.ik_fk_checkbox.toggled.connect(
+            self.controller.toggle_ik_fk_setting
+        )
+
+        self.motion_paths_checkbox.toggled.connect(
+            self.controller.toggle_motion_paths_setting
         )
 
         # ----------------------------------------------------

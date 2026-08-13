@@ -4,7 +4,7 @@
 
 QWidget
 {
-    background: #2f2f2f;
+    background: #222222; /* Darkened from #2f2f2f */
     color: #d7d7d7;
     font-family: "Segoe UI";
 }
@@ -64,6 +64,18 @@ QPushButton#ikfkOverlayButton
     min-width: 0px;
     max-width: 16777215px;
     padding: 0px;
+}
+
+/* Label paired with the Live toggle switch - transparent so it doesn't
+   draw the generic QWidget background as an opaque box over the canvas. */
+QLabel#ikfkOverlayLabel
+{
+    background: transparent;
+}
+
+QLabel#ikfkOverlayLabel:disabled
+{
+    color: #6f6f6f;
 }
 
 /*--------------------------------------------------

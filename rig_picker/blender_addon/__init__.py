@@ -41,7 +41,7 @@ classes = (
 
 
 from .dependency import ensure_qt
-from .backend import poll_active_armature, _POLL_INTERVAL
+from .backend import poll_active_armature, on_frame_change, _POLL_INTERVAL
 
 
 def register():
@@ -85,6 +85,14 @@ def register():
             persistent=True,
         )
 
+    # ----------------------------------------------------
+    # Watch for the current frame changing (scrubbing the timeline,
+    # playback, jumping between keyframes) so the IK/FK toggle label
+    # updates live instead of only refreshing when a control is clicked.
+    # ----------------------------------------------------
+    if on_frame_change not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(on_frame_change)
+
 
 def unregister():
 
@@ -93,6 +101,12 @@ def unregister():
     # ----------------------------------------------------
     if bpy.app.timers.is_registered(poll_active_armature):
         bpy.app.timers.unregister(poll_active_armature)
+
+    # ----------------------------------------------------
+    # Stop watching for frame changes
+    # ----------------------------------------------------
+    if on_frame_change in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(on_frame_change)
 
     backend._ACTIVE_CONTROLLER = None
     backend._ACTIVE_WINDOW = None

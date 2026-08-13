@@ -116,15 +116,6 @@ IK_FK_GROUPS = {
 }
 
 
-def refresh_3d_view(context):
-    """Triggers an instant GPU redraw of all 3D Viewport areas."""
-    context.view_layer.update()
-    for window in context.window_manager.windows:
-        for area in window.screen.areas:
-            if area.type == 'VIEW_3D':
-                area.tag_redraw()
-
-
 class Controller:
 
     def __init__(self):
@@ -171,6 +162,40 @@ class Controller:
             self.window.size_combo.setEnabled(False)
             self.window.shape_combo.setEnabled(False)
             self.window.color_combo.setEnabled(False)
+
+            # Keep the dropdown's displayed text in sync when the active
+            # armature changes from outside the combo itself (e.g. clicking
+            # a different rig in the 3D viewport, detected by
+            # backend.poll_active_armature). Block signals while setting it
+            # so this doesn't re-trigger change_armature() and recurse back
+            # into load_armature().
+            combo = self.window.armature_combo
+            target_text = self.armature_name or ""
+            if combo.currentText() != target_text:
+                combo.blockSignals(True)
+                index = combo.findText(target_text)
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+                combo.blockSignals(False)
+
+    def change_armature(self, armature_name):
+        rig = bpy.data.objects.get(armature_name)
+        if rig is None or rig.type != "ARMATURE":
+            return
+
+        backend._CACHED_ARM = rig
+        backend._CACHED_ARM_NAME = rig.name
+
+        view_layer = bpy.context.view_layer
+        for obj in view_layer.objects:
+            if obj != rig and obj.select_get():
+                obj.select_set(False)
+
+        view_layer.objects.active = rig
+        rig.select_set(True)
+
+        self.load_armature(rig)
+
 
     def save(self):
         """Writes the current in-memory data to rig_picker_data.json."""
@@ -251,6 +276,23 @@ class Controller:
         )
         self.window.symmetry_checkbox.blockSignals(False)
 
+        self.window.ik_fk_checkbox.blockSignals(True)
+        self.window.ik_fk_checkbox.setChecked(
+            self.data.get("ik_fk_enabled", False)
+        )
+        self.window.ik_fk_checkbox.blockSignals(False)
+
+        canvas.ikfk_controls_enabled = self.data.get("ik_fk_enabled", False)
+
+        self.window.motion_paths_checkbox.blockSignals(True)
+        self.window.motion_paths_checkbox.setChecked(
+            self.data.get("motion_paths_enabled", False)
+        )
+        self.window.motion_paths_checkbox.blockSignals(False)
+
+        canvas.motion_paths_controls_enabled = self.data.get("motion_paths_enabled", False)
+        canvas.update_overlay_buttons()
+
         for item in self.data["items"]:
             x = None if item["x"] < 0 else item["x"]
             y = None if item["y"] < 0 else item["y"]
@@ -281,7 +323,6 @@ class Controller:
         if not rig:
             return
 
-        CONTROL_SIZE = 36.0
         existing = {item["bone_name"] for item in self.data["items"]}
 
         for pb in rig.pose.bones:
@@ -304,17 +345,29 @@ class Controller:
                 mirror_item = self.find_item(mirror)
 
                 if mirror_item and mirror_item["x"] >= 0 and mirror_item["y"] >= 0:
-                    mirror_center = mirror_item["x"] + CONTROL_SIZE / 2
-                    new_center = 2 * self.data.get("symmetry_x", -1.0) - mirror_center
 
-                    new_item["x"] = new_center - CONTROL_SIZE / 2
+                    # Copy appearance first
+                    new_item["control_size"] = mirror_item["control_size"]
+                    new_item["control_shape"] = mirror_item["control_shape"]
+                    new_item["control_color"] = mirror_item["control_color"]
+
+                    size = new_item["control_size"]
+
+                    if new_item["control_shape"] == "RECTANGLE":
+                        width = max(14, round(size * 1.6))
+                    else:
+                        width = size
+
+                    mirror_center = mirror_item["x"] + width / 2.0
+                    new_center = 2.0 * self.data["symmetry_x"] - mirror_center
+
+                    new_item["x"] = new_center - width / 2.0
                     new_item["y"] = mirror_item["y"]
 
             self.data["items"].append(new_item)
 
         self.save()
         self.refresh()
-
     # ---------------------------------------------------------
 
     def select_control(self, bone_name, shift=False):
@@ -480,7 +533,25 @@ class Controller:
 
     def clear_all(self):
         self.data["items"] = []
+
+        # Delete the captured background too, not just the controls -
+        # both the JSON reference and the actual image file on disk, so
+        # it doesn't linger and get silently picked back up later.
+        image_path = self.data.get("background")
+
+        self.data["background"] = ""
+        self.data["image_offset_x"] = 0.0
+        self.data["image_offset_y"] = 0.0
+
         self.save()
+
+        if image_path:
+            try:
+                if os.path.exists(image_path):
+                    os.remove(image_path)
+            except OSError:
+                import traceback
+                traceback.print_exc()
 
         bpy.ops.rp.hide_all()
         self.refresh()
@@ -562,13 +633,12 @@ class Controller:
         rig = arm()
 
         if rig and rig.type == 'ARMATURE':
-            for pb in rig.pose.bones:
-                pb.select = False
-                pb.bone.hide = True
             rig.data.bones.active = None
 
-            # Refresh 3D Viewport immediately
-            refresh_3d_view(bpy.context)
+            # Use the same operator-backed approach as the Hide All button
+            # (reveal -> deselect -> hide) instead of poking bone.hide
+            # directly, so behavior/context-handling stays consistent.
+            bpy.ops.rp.hide_all()
 
         self.refresh_ikfk_label()
 
@@ -584,6 +654,25 @@ class Controller:
 
         canvas.symmetry_x = self.data["symmetry_x"]
         canvas.update()
+
+    def toggle_ik_fk_setting(self, enabled):
+        """Persists the IK-FK checkbox state and shows/hides the IK/FK
+        switch plus its two snapping buttons (FK->IK, IK->FK) on the
+        canvas accordingly."""
+        self.data["ik_fk_enabled"] = enabled
+
+        canvas = self.window.control_list.container
+        canvas.ikfk_controls_enabled = enabled
+        canvas.update_overlay_buttons()
+
+    def toggle_motion_paths_setting(self, enabled):
+        """Persists the Motion Paths checkbox state and shows/hides the
+        Calculate/Clear motion-path buttons on the canvas accordingly."""
+        self.data["motion_paths_enabled"] = enabled
+
+        canvas = self.window.control_list.container
+        canvas.motion_paths_controls_enabled = enabled
+        canvas.update_overlay_buttons()
 
         self.save()
     def toggle_ik_fk(self):

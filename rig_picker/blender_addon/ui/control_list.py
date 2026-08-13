@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QScrollArea,
     QPushButton,
+    QLabel,
 )
 from PySide6.QtGui import (
     QPen,
@@ -15,6 +16,7 @@ from PySide6.QtGui import (
 )
 
 from .circle_control import CircleControl
+from .toggle_switch import ToggleSwitch
 from PySide6.QtGui import QPixmap, QPainter, QImage, QPolygon, QFontMetrics, QFont
 from PySide6.QtCore import Qt, QPoint, QRect
 
@@ -153,14 +155,12 @@ class PickerCanvas(QWidget):
         self.control_list = None
 
        # IK/FK overlay buttons
-        self.ikfk_toggle_button = QPushButton("FK | IK", self)
         self.fk_to_ik_button = QPushButton("FK → IK", self)
         self.ik_to_fk_button = QPushButton("IK → FK", self)
         self.calculate_path_button = QPushButton("Calculate", self)
         self.clear_path_button = QPushButton("x", self)
 
         for btn in (
-            self.ikfk_toggle_button,
             self.fk_to_ik_button,
             self.ik_to_fk_button,
             self.calculate_path_button,
@@ -183,6 +183,34 @@ class PickerCanvas(QWidget):
 
             btn.raise_()
             btn.hide()
+
+        # IK <-> FK switch - a sliding toggle with a fixed "IK" label on
+        # the left and "FK" label on the right, in place of the old
+        # text-swapping button. The knob's position reflects the
+        # currently selected bone's actual IK_FK state (left = IK,
+        # right = FK) and slides live as that state changes - whether
+        # from clicking a control, using the switch itself, or (with the
+        # Live toggle on) simply scrubbing to a different frame. Clicking
+        # it anywhere still performs the same FK<->IK switch the old
+        # button did.
+        self.ikfk_label_left = QLabel("IK", self)
+        self.ikfk_label_left.setObjectName("ikfkOverlayLabel")
+        self.ikfk_label_right = QLabel("FK", self)
+        self.ikfk_label_right.setObjectName("ikfkOverlayLabel")
+        self.ikfk_switch = ToggleSwitch(checked=False, parent=self)
+
+        # Neutral until a bone with a live IK_FK state is selected -
+        # matches update_ikfk_toggle(None) below.
+        self.ikfk_switch.setEnabled(False)
+
+        for widget in (self.ikfk_label_left, self.ikfk_switch, self.ikfk_label_right):
+            if isinstance(widget, QLabel):
+                widget.adjustSize()
+            widget._base_width = widget.width()
+            widget._base_height = widget.height()
+            widget.raise_()
+            widget.hide()
+
         # Background image position
         self.image_x = 0
         self.image_y = 0
@@ -205,9 +233,20 @@ class PickerCanvas(QWidget):
 
         self.symmetry_handle_size = 14
         self.symmetry_handle_hover = False
+
+        # Controls whether the IK/FK switch and its two snapping buttons
+        # (FK -> IK, IK -> FK) are shown on the canvas at all. Driven by
+        # the "IK-FK" checkbox in the main window; the Calculate/Clear
+        # motion-path buttons are unaffected by this.
+        self.ikfk_controls_enabled = False
+
+        # Controls whether the Calculate/Clear motion-path buttons are
+        # shown on the canvas. Driven by the "Motion Paths" checkbox in
+        # the main window.
+        self.motion_paths_controls_enabled = False
     
     def connect_controller(self, controller):
-        self.ikfk_toggle_button.clicked.connect(controller.toggle_ik_fk)
+        self.ikfk_switch.toggled.connect(lambda checked: controller.toggle_ik_fk())
         self.fk_to_ik_button.clicked.connect(controller.fk_to_ik)
         self.ik_to_fk_button.clicked.connect(controller.ik_to_fk)
         self.calculate_path_button.clicked.connect(controller.calculate_motion_path)
@@ -356,26 +395,23 @@ class PickerCanvas(QWidget):
     def update_ikfk_toggle(self, is_fk):
         """is_fk: True if the selected bone is currently in FK, False if
         currently in IK, or None if there's no single selected bone
-        belonging to an IK/FK group. The button always shows the state
-        it will switch TO if clicked, not the current state - so it's
-        never ambiguous which way it's about to flip."""
-        self.ikfk_toggle_button.blockSignals(True)
+        belonging to an IK/FK group. Unlike the old text-swapping button,
+        the switch shows the CURRENT state (knob left = IK, right = FK)
+        and slides to match it - clicking it (or the state changing under
+        it, e.g. via the Live toggle) is what makes it move."""
+        self.ikfk_switch.blockSignals(True)
 
         if is_fk is None:
-            self.ikfk_toggle_button.setChecked(False)
-            self.ikfk_toggle_button.setText("FK | IK")
-        elif is_fk:
-            # Currently FK -> clicking switches TO IK
-            self.ikfk_toggle_button.setChecked(True)
-            self.ikfk_toggle_button.setText("\u2192IK")
+            self.ikfk_switch.setEnabled(False)
+            self.ikfk_label_left.setEnabled(False)
+            self.ikfk_label_right.setEnabled(False)
         else:
-            # Currently IK -> clicking switches TO FK
-            self.ikfk_toggle_button.setChecked(False)
-            self.ikfk_toggle_button.setText("\u2192FK")
+            self.ikfk_switch.setEnabled(True)
+            self.ikfk_label_left.setEnabled(True)
+            self.ikfk_label_right.setEnabled(True)
+            self.ikfk_switch.set_checked(is_fk)
 
-        self.fit_font(self.ikfk_toggle_button)
-
-        self.ikfk_toggle_button.blockSignals(False)
+        self.ikfk_switch.blockSignals(False)
 
 
     def update_overlay_buttons(self):
@@ -383,11 +419,17 @@ class PickerCanvas(QWidget):
         # Each entry is a row; a row with more than one button lays them
         # out side by side instead of stacking them.
         rows = (
-            (self.ikfk_toggle_button,),
+            (self.ikfk_label_left, self.ikfk_switch, self.ikfk_label_right),
             (self.fk_to_ik_button,),
             (self.ik_to_fk_button,),
             (self.calculate_path_button, self.clear_path_button),
         )
+
+        # The switch and its two snapping buttons are gated behind the
+        # "IK-FK" checkbox; the motion-path row is gated behind the
+        # "Motion Paths" checkbox.
+        ikfk_rows = rows[:3]
+        motion_path_rows = rows[3:]
 
         all_buttons = [btn for row in rows for btn in row]
 
@@ -396,14 +438,31 @@ class PickerCanvas(QWidget):
                 btn.hide()
             return
 
+        if not self.ikfk_controls_enabled:
+            for row in ikfk_rows:
+                for btn in row:
+                    btn.hide()
+            rows = tuple(row for row in rows if row not in ikfk_rows)
+
+        if not self.motion_paths_controls_enabled:
+            for row in motion_path_rows:
+                for btn in row:
+                    btn.hide()
+            rows = tuple(row for row in rows if row not in motion_path_rows)
+
         scale = self.image_scale()
 
         # Slightly larger than picker controls
         button_scale = max(0.1, scale) * 2.0
-        font_scale = max(0.1, scale) * 0.5
 
         margin = round(10 * button_scale)
         spacing = round(4 * button_scale)
+
+        # The IK/FK switch and its two flanking labels read as one
+        # compound control, not three separate ones - so they sit much
+        # closer together than the spacing between separate buttons.
+        tight_spacing = round(-3 * button_scale)
+        tight_rows = (self.ikfk_label_left, self.ikfk_switch, self.ikfk_label_right)
 
         x = self.image_x + margin
         y = self.image_y + margin
@@ -412,6 +471,7 @@ class PickerCanvas(QWidget):
 
             row_x = x
             row_height = 0
+            row_spacing = tight_spacing if row == tight_rows else spacing
 
             for btn in row:
 
@@ -419,14 +479,19 @@ class PickerCanvas(QWidget):
                 height = max(8, round(btn._base_height * button_scale))
 
                 btn.setFixedSize(width, height)
-                self.fit_font(btn)
+
+                # ToggleSwitch has no text to size a font for - it's
+                # drawn entirely in paintEvent - so skip the QPushButton/
+                # QLabel-only font-fitting step for it.
+                if hasattr(btn, "text"):
+                    self.fit_font(btn)
 
                 btn.move(round(row_x), round(y))
 
                 btn.raise_()
                 btn.show()
 
-                row_x += width + spacing
+                row_x += width + row_spacing
                 row_height = max(row_height, height)
 
             y += row_height + spacing
@@ -446,6 +511,11 @@ class PickerCanvas(QWidget):
             self.image_x,
             self.image_y,
             pixmap
+        )
+        # Dark overlay
+        painter.fillRect(
+            self.rect(),
+            QColor(0, 0, 0, 50)   # Alpha: 0-255
         )
         if self.symmetry_enabled and self.symmetry_x >= 0:
 

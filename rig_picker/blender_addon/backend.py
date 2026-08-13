@@ -1,6 +1,7 @@
 import os
 import tempfile
 import bpy
+from bpy.app.handlers import persistent
 
 # Global cache for the active armature reference
 _CACHED_ARM: bpy.types.Object | None = None
@@ -80,6 +81,40 @@ def poll_active_armature():
         traceback.print_exc()
 
     return _POLL_INTERVAL  # returning a number reschedules the timer
+
+
+@persistent
+def on_frame_change(scene, depsgraph=None):
+    """Registered as a frame_change_post handler.
+
+    Runs whenever the current frame changes - scrubbing the timeline,
+    stepping through keyframes, or playback - so the IK/FK toggle label
+    stays in sync with whatever the animated IK_FK custom property
+    evaluates to at that frame, not just whatever it was when a control
+    was last clicked.
+
+    frame_change_post (rather than _pre) is used deliberately: it fires
+    after Blender has evaluated the new frame's animation, so pose bone
+    property values (like IK_FK) are already up to date when this runs.
+
+    @persistent is required here: without it, Blender silently drops
+    every handler in bpy.app.handlers.* the moment a .blend file is
+    loaded (New or Open) - even mid-session, after register() already
+    ran once. poll_active_armature doesn't need this because it's a
+    bpy.app.timers callback, not an application handler; timers have
+    their own separate persistent=True flag passed at registration.
+
+    Only reads property values and updates a Qt label - no bpy.ops calls -
+    so it's safe to run from this handler.
+    """
+    if _ACTIVE_CONTROLLER is None:
+        return
+
+    try:
+        _ACTIVE_CONTROLLER.refresh_ikfk_label()
+    except Exception:
+        import traceback
+        traceback.print_exc()
 
 
 def ensure_pose(context, rig):

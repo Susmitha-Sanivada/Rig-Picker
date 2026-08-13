@@ -9,6 +9,8 @@ Storage layout (rig_picker_data.json):
         "background": "C:/.../capture.png",
         "symmetry": false,
         "symmetry_x": -1.0,
+        "ik_fk_enabled": false,
+        "motion_paths_enabled": false,
         "items": [
             {
                 "bone_name": "hand.L",
@@ -206,6 +208,8 @@ def new_armature_data():
         "background": "",
         "symmetry": False,
         "symmetry_x": -1.0,
+        "ik_fk_enabled": False,
+        "motion_paths_enabled": False,
         "image_offset_x": 0.0,
         "image_offset_y": 0.0,
         "items": [],
