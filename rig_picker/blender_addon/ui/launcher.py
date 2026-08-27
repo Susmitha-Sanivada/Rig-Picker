@@ -85,3 +85,31 @@ def show_picker():
     _window.activateWindow()
 
     return _window
+
+
+def close_picker():
+    """Closes the picker window if one is currently open, and forgets the
+    reference to it.
+
+    Called from __init__.unregister() - without this, disabling the addon
+    (or reloading scripts) while the picker is open left the window on
+    screen holding a controller wired up to bpy.ops.rp.* operator classes
+    that unregister() is about to remove. Every click on it afterward
+    would raise AttributeError instead of just... not being clickable, and
+    the window itself never got cleaned up at all.
+    """
+    global _window
+
+    # Nothing to do if the picker was never opened this session - skip
+    # the shiboken6 import entirely rather than risk it failing because
+    # ensure_qt() (which installs PySide6/shiboken6) never got a chance
+    # to run.
+    if _window is None:
+        return
+
+    import shiboken6
+
+    if shiboken6.isValid(_window):
+        _window.close()
+
+    _window = None

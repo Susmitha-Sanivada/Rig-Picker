@@ -16,12 +16,12 @@ class ToggleSwitch(QWidget):
     toggled = Signal(bool)
 
     TRACK_OFF = QColor(70, 70, 70)
-    TRACK_ON = QColor(58, 142, 88)   # matches CircleControl's "GREEN"
+    TRACK_ON = QColor(79, 134, 247)  # matches the checked checkbox color (#4f86f7)
     BORDER = QColor(15, 15, 15, 200)
     KNOB = QColor(232, 232, 232)
 
     TRACK_OFF_DISABLED = QColor(50, 50, 50)
-    TRACK_ON_DISABLED = QColor(60, 80, 66)
+    TRACK_ON_DISABLED = QColor(63, 88, 139)
     KNOB_DISABLED = QColor(150, 150, 150)
 
     def __init__(self, checked=False, parent=None):

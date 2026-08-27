@@ -87,6 +87,20 @@ def install_pyside():
 
     target = python_folder()
 
+    # Always install into a clean folder, not on top of whatever's
+    # already there. `pip install --upgrade --target` layers new files
+    # over old ones rather than removing files an older version had
+    # that the new one doesn't - across several upgrades this can leave
+    # DLLs/pyd files from different PySide6 releases coexisting in the
+    # same folder. Mismatched native Qt/shiboken binaries loaded
+    # together are a well-known cause of an access violation crash the
+    # instant QtCore is first imported (Blender crashing on startup with
+    # a fault inside shiboken6.abi3.dll/QtCore.pyd, before any of the
+    # addon's own UI code runs, is the signature of exactly this).
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True, exist_ok=True)
+
     print("=" * 60)
     print("Installing PySide6")
     print("Target:", target)
@@ -108,13 +122,26 @@ def install_pyside():
         "pip",
     ])
 
+    # Pinned, not "--upgrade" to whatever is newest on PyPI. PySide6
+    # only reaches PyPI after Qt's own release, and brand-new Qt/
+    # shiboken6 builds have repeatedly shown first-import native crashes
+    # specifically when embedded inside a host interpreter like
+    # Blender's (rather than run as a normal standalone application) -
+    # see e.g. the Blender project's own "PySide6 shiboken6 conflict"
+    # tracker issue. Pinning to a release that's had time to prove
+    # itself in this exact embedded-Qt-in-Blender scenario, rather than
+    # always grabbing the latest, avoids installing straight into a
+    # known-bad combination on a fresh machine. Bump this deliberately
+    # (and re-test in Blender) rather than letting it float.
+    PYSIDE6_VERSION = "6.8.3"
+
     subprocess.check_call([
         str(python),
         "-m",
         "pip",
         "install",
-        "--upgrade",
-        "PySide6",
+        f"PySide6=={PYSIDE6_VERSION}",
+        f"shiboken6=={PYSIDE6_VERSION}",
         "blender-qt-stylesheet",
         "qtpy",
         "--target",

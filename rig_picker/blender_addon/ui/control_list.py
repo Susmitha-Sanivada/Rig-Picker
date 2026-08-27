@@ -21,6 +21,49 @@ from PySide6.QtGui import QPixmap, QPainter, QImage, QPolygon, QFontMetrics, QFo
 from PySide6.QtCore import Qt, QPoint, QRect
 
 
+# Fallback scale used only when no background image is loaded yet (so
+# controls still get a sane, stable size before any capture). Once a
+# background is loaded, image_scale() ignores this and computes the
+# real on-canvas scale of that image instead, so controls track it as
+# the window is resized.
+DEFAULT_IMAGE_SCALE_ESTIMATE = 1.0
+
+# Reference size used ONLY for spacing out auto-placed controls in
+# add_control()'s fallback grid (when a control has no saved position
+# yet) - deliberately NOT the same as each control's own actual
+# control_size. A grid only avoids overlap if every cell reserves the
+# same amount of space regardless of what ends up placed in it; using
+# each control's own (possibly customized) size for its own cell's step
+# meant a wider control could extend past its own cell boundary into
+# wherever a narrower neighboring control landed. This is set a bit
+# above the default control size (18) to comfortably cover typical
+# resized-larger controls too, without needing to know every item's
+# actual size in advance. Kept close to the default (rather than far
+# above it) so auto-placed controls end up snugly spaced instead of
+# scattered with visibly empty gaps between them.
+GRID_CELL_REFERENCE_SIZE = 20
+
+# Fixed pixel gap between grid cells, and the margin kept clear around
+# the edge of the background image. Both are in "image space" (see
+# _next_grid_position()'s docstring for what that actually means).
+GRID_GAP = 6
+GRID_MARGIN = 16
+
+# Horizontal spacing between auto-placed controls is deliberately looser
+# than it needs to be for default-sized controls if the full step (cell
+# width + gap) is used - halving just the horizontal step tightens that
+# up while leaving row spacing (which wasn't reported as a problem)
+# alone.
+HORIZONTAL_SPACING_SCALE = 0.5
+
+# Fallback grid width (image-space pixels) used only when no background
+# image is loaded yet to measure against - shouldn't normally happen,
+# since Add Selected is disabled until a background exists, but keeps
+# this from crashing/misbehaving if it's ever called anyway.
+GRID_FALLBACK_WIDTH = 320
+
+
+
 class ControlList(QScrollArea):
 
     def __init__(self):
@@ -39,7 +82,7 @@ class ControlList(QScrollArea):
 
     # -----------------------------------------------------
 
-    def add_control(self, bone_name, x=None, y=None, size=36, shape="CIRCLE", color="GREEN"):
+    def add_control(self, bone_name, x=None, y=None, size=18, shape="CIRCLE", color="GREEN"):
 
         if bone_name in self.controls:
             return
@@ -50,11 +93,7 @@ class ControlList(QScrollArea):
         control.setParent(self.container)
 
         if x is None or y is None:
-
-            index = len(self.controls)
-
-            x = 30 + (index % 8) * 35
-            y = 30 + (index // 8) * 35
+            x, y = self._next_grid_position(len(self.controls))
 
         # Positions saved in Blender are in the unscaled background image's
         # coordinate space, not the current canvas's pixel space.
@@ -65,6 +104,67 @@ class ControlList(QScrollArea):
         control.show()
 
         return control
+
+    def _next_grid_position(self, index):
+        """Computes the auto-placed (x, y) - in image space - for the
+        index'th control with no saved position yet.
+
+        "Image space" here is NOT the background's raw native pixel
+        size. image_scale() (see PickerCanvas) re-baselines to the
+        CANVAS WIDGET's on-screen size the moment a background loads
+        (reset_scale_reference()), so control.image_position - and
+        therefore this grid - has to be measured in that same
+        canvas-relative space, not the source PNG's actual resolution.
+        Using the raw pixel width here (as an earlier version of this
+        function did) meant the bound itself was frequently many times
+        wider than the space controls are really laid out in - e.g. a
+        captured image saved at 1200px wide but displayed in a 320px
+        canvas - so the grid still placed later controls well outside
+        the visible image despite "fitting" against that wrong number.
+        canvas_to_image_position() is the addon's own established
+        conversion for this (see Controller._ensure_symmetry_default(),
+        which hits the exact same trap for the symmetry guide line) -
+        reused here instead of re-deriving it.
+        """
+        from ..backend import control_dimensions
+
+        cell_width, cell_height = control_dimensions(
+            GRID_CELL_REFERENCE_SIZE, "RECTANGLE"
+        )
+        step_x = max(1, round((cell_width + GRID_GAP) * HORIZONTAL_SPACING_SCALE))
+        step_y = cell_height + GRID_GAP
+
+        canvas = self.container
+        pixmap = canvas.scaled_background()
+
+        if pixmap is not None and pixmap.width() > 0:
+            image_width = canvas.canvas_to_image_position(
+                QPoint(canvas.image_x + pixmap.width(), 0)
+            ).x()
+        else:
+            image_width = 0
+
+        if image_width <= 0:
+            image_width = GRID_FALLBACK_WIDTH
+
+        usable_width = max(image_width - 2 * GRID_MARGIN, step_x)
+        columns = max(1, (usable_width // step_x) + 1)
+
+        column = index % columns
+
+        row = index // columns
+
+        x = GRID_MARGIN + column * step_x
+        y = GRID_MARGIN + row * step_y
+
+        # Belt-and-braces clamp: guards against the last column's cell
+        # nosing past the image's right edge on an odd width/step
+        # combination, keeping every auto-placed control's full cell
+        # (not just its top-left corner) within the image.
+        max_x = max(GRID_MARGIN, image_width - cell_width - GRID_MARGIN)
+        x = min(x, max_x)
+
+        return x, y
 
     # -----------------------------------------------------
 
@@ -89,11 +189,25 @@ class ControlList(QScrollArea):
         self.controls.clear()
 
     def set_background(self, image_path, offset_x=0.0, offset_y=0.0):
+        """Loads image_path onto the canvas. Returns True on success.
+
+        On failure (missing file, moved .blend, corrupted image, stale
+        path, etc.) this must never just bail out and leave whatever
+        image happens to already be on the canvas - that's what let one
+        rig's background silently bleed into another rig that has no
+        (or a broken) saved image of its own. Fall back to a clean,
+        background-less canvas instead, and report failure so callers
+        (Controller.refresh()) can also stop treating this rig as
+        "has a background" - keeping the Add/Clear/Delete/Symmetry/
+        IK-FK/Motion Paths buttons correctly disabled instead of staying
+        enabled against an image that isn't actually there.
+        """
 
         image = QImage(image_path)
 
         if image.isNull():
-            return
+            self.clear_background()
+            return False
 
         width = image.width()
         height = image.height()
@@ -116,6 +230,12 @@ class ControlList(QScrollArea):
 
         self.container.background = pixmap
 
+        # Loading (or swapping in) a background image should never by
+        # itself resize/move the controls - only re-baseline the "1.0
+        # scale" point to the canvas's current size, so a *later* window
+        # resize is what changes their scale from here on.
+        self.container.reset_scale_reference()
+
         # Restore the saved relative drag position (0..1) instead of
         # always resetting to the top-left corner, so switching back to
         # an armature keeps its previously-dragged image position.
@@ -127,11 +247,15 @@ class ControlList(QScrollArea):
         self.container.update_overlay_buttons()
         self.container.update()
 
+        return True
+
     def clear_background(self):
         """Removes the background image (e.g. when switching to an armature
-        that has no captured view saved yet)."""
+        that has no captured view saved yet, or one whose saved image
+        failed to load)."""
 
         self.container.background = None
+        self.container._scale_reference_size = None
 
         self.container.image_x = 0
         self.container.image_y = 0
@@ -143,12 +267,19 @@ class ControlList(QScrollArea):
         self.container.update_overlay_buttons()
         self.container.update()
 
+        return False
+
 class PickerCanvas(QWidget):
 
     def __init__(self):
         super().__init__()
 
         self.background = None
+
+        # The canvas size captured as the "1.0 scale" baseline for
+        # image_scale() - see reset_scale_reference(). None until a
+        # background is first loaded.
+        self._scale_reference_size = None
 
         # Set by ControlList right after construction; defaulted here so
         # it's always safe to reference even before that happens.
@@ -168,6 +299,24 @@ class PickerCanvas(QWidget):
         ):
             btn.setObjectName("ikfkOverlayButton")
 
+            # ensurePolished() forces Qt to resolve this widget's
+            # stylesheet rules (including the #ikfkOverlayButton id
+            # selector below, which zeroes out the generic QPushButton
+            # rule's padding/min-height/max-height so setFixedSize() can
+            # fully control this button's size later) right now, instead
+            # of leaving that resolution to happen lazily on first show/
+            # paint. Without this, adjustSize() below can compute
+            # sizeHint() against the generic QPushButton rule's
+            # `padding: 1px 6px` / `min-height: 18px` / `max-height: 20px`
+            # (since #ikfkOverlayButton hasn't been "polished" in yet),
+            # inflating _base_width/_base_height. That wrong base then
+            # gets baked into every future button_scale calculation in
+            # update_overlay_buttons() for the rest of the session, since
+            # nothing ever re-captures it afterward - unlike the picker
+            # controls' geometry, which is computed fresh each time from
+            # control_dimensions() rather than a cached, polish-dependent
+            # base size.
+            btn.ensurePolished()
             btn.adjustSize()
 
             btn._base_width = btn.width()
@@ -213,6 +362,11 @@ class PickerCanvas(QWidget):
         self.ikfk_switch.setEnabled(False)
 
         for widget in (self.ikfk_label_left, self.ikfk_switch, self.ikfk_label_right):
+            # Same reasoning as the ensurePolished() call above for the
+            # overlay buttons - resolve #ikfkOverlayLabel's stylesheet
+            # rule before measuring, so a plain-click-through construction
+            # order doesn't leave adjustSize() reading unstyled metrics.
+            widget.ensurePolished()
             if isinstance(widget, QLabel):
                 widget.adjustSize()
             widget._base_width = widget.width()
@@ -230,6 +384,15 @@ class PickerCanvas(QWidget):
 
         # Dragging state
         self.drag_start = None
+
+        # Press position for a click that *might* turn into a symmetry-line
+        # or background-image drag, but hasn't crossed the movement
+        # threshold yet - see mousePressEvent/mouseMoveEvent. A plain click
+        # with no movement never sets dragging_symmetry/dragging_image and
+        # never records an undo snapshot.
+        self._pending_drag_start = None
+        self._pending_drag_kind = None  # "symmetry" | "image" | None
+        self.DRAG_THRESHOLD = 4
 
         self.symmetry_enabled = False
 
@@ -271,12 +434,84 @@ class PickerCanvas(QWidget):
             Qt.SmoothTransformation,
         )
 
-    def image_scale(self):
-        pixmap = self.scaled_background()
-        if pixmap is None or self.background.width() == 0:
-            return 1.0
+    def reset_scale_reference(self):
+        """Captures the canvas's current size as the new "1.0 scale"
+        baseline for image_scale() - call this whenever the background
+        image itself changes (a picture loaded or swapped in, e.g. via
+        the JSON data's "background" property changing on armature
+        switch/capture), NOT on a plain window resize.
 
+        Right after this runs, image_scale() returns 1.0, so controls
+        are laid out at exactly their saved size/position - loading a
+        new image never itself resizes or moves them. Only a canvas
+        resize *after* this point (maximizing/restoring/dragging the
+        window) changes the scale from here on, since it changes the
+        displayed image size relative to this baseline rather than
+        relative to the image's native pixel size."""
+        self._scale_reference_size = self.size()
+
+    def native_image_scale(self):
+        """Returns current display width / native background pixel width
+        - the raw ratio the original addon used for image_scale() before
+        the reference-baseline rework above. Kept as a separate method
+        (not reused for image_scale() itself) because switching the
+        picker CONTROLS to this raw ratio is exactly what caused their
+        session-to-session size drift: this ratio is typically well
+        under 1.0 (a screen-sized canvas showing a much-higher-resolution
+        source image) and isn't stable across restarts/whether a
+        background is loaded at all, whereas image_scale()'s baseline-
+        relative definition is.
+
+        The IK/FK and motion-path OVERLAY BUTTONS, unlike the picker
+        controls, were never given an image-space "native size" via
+        control_dimensions() - their _base_width/_base_height is just
+        whatever Qt/the stylesheet computed for the unstyled button at
+        construction time, sized to look right when multiplied by a
+        typically-small raw ratio like this one. Multiplying that same
+        base by the new image_scale() instead (which is 1.0 right after
+        any image loads, regardless of that image's actual resolution)
+        made these buttons balloon to ~2x their base size on load and
+        stop tracking the image's actual on-canvas size - so overlay
+        buttons use this method instead, matching the original addon's
+        behavior, while picker controls keep using image_scale().
+        """
+        pixmap = self.scaled_background()
+        if pixmap is None or self.background is None or self.background.width() == 0:
+            return 1.0
         return pixmap.width() / self.background.width()
+
+    def image_scale(self):
+        """Returns how large the background image is currently being
+        drawn on the canvas relative to how large it was drawn right
+        after it was (last) loaded - see reset_scale_reference(). A
+        window resize after that point grows/shrinks this ratio, which
+        controls are multiplied by (see canvas_to_image_position /
+        layout_controls) so they track the image's on-screen size and
+        position as the window is resized. Loading a new background
+        image itself never changes this ratio, since
+        reset_scale_reference() re-baselines it to the canvas's size at
+        that exact moment.
+
+        Falls back to DEFAULT_IMAGE_SCALE_ESTIMATE (a no-op 1.0) when
+        there's no background loaded yet, or no baseline has been
+        captured yet."""
+        if self.background is None or self.background.width() <= 0:
+            return DEFAULT_IMAGE_SCALE_ESTIMATE
+
+        if self._scale_reference_size is None or self._scale_reference_size.isEmpty():
+            return DEFAULT_IMAGE_SCALE_ESTIMATE
+
+        reference_display = self.background.scaled(
+            self._scale_reference_size,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+
+        if reference_display.width() <= 0:
+            return DEFAULT_IMAGE_SCALE_ESTIMATE
+
+        current_display = self.scaled_background()
+        return current_display.width() / reference_display.width()
 
     def canvas_to_image_position(self, position):
         """Convert a canvas point to the unscaled background image space."""
@@ -304,9 +539,15 @@ class PickerCanvas(QWidget):
             display_x = self.image_x + control.image_position.x() * scale
             display_y = self.image_y + control.image_position.y() * scale
 
+            # round(), not int(): truncation biases every control's
+            # on-screen position left/up by up to half a pixel whenever
+            # display_x/display_y land on a fractional remainder - the
+            # same issue already fixed for the mirror control's stored
+            # position above, but this is what actually paints controls
+            # on screen, so it was still visible after a symmetry snap.
             control.move(
-                int(display_x),
-                int(display_y),
+                round(display_x),
+                round(display_y),
             )
 
     def move_control_from_canvas(self, control, position):
@@ -321,7 +562,7 @@ class PickerCanvas(QWidget):
 
         if controller.data.get("symmetry"):
 
-            from ..backend import mirror_name
+            from ..backend import mirror_name, control_dimensions
 
             mirror_bone = mirror_name(control.bone_name)
 
@@ -331,16 +572,34 @@ class PickerCanvas(QWidget):
 
                 if mirror_control:
 
-                    CONTROL_SIZE = control.size
+                    # Each control can have its own size/shape, so its
+                    # on-screen width can differ from its mirror's - use
+                    # control_dimensions() (the same source of truth used
+                    # everywhere else in the codebase, e.g. controller.py's
+                    # appearance-resize re-centering) to get *each*
+                    # control's own width instead of reusing the dragged
+                    # control's width for both. Reusing one width for both
+                    # is exactly why the mirror control was landing off
+                    # the symmetry line whenever the two controls' sizes
+                    # or shapes differed.
+                    control_width, _ = control_dimensions(control.size, control.shape)
+                    mirror_width, _ = control_dimensions(
+                        mirror_control.size, mirror_control.shape
+                    )
 
-                    center = control.image_position.x() + CONTROL_SIZE // 2
+                    center = control.image_position.x() + control_width / 2.0
                     mirror_center = (
                         2 * controller.data["symmetry_x"]
                         - center
                     )
-                    mirror_x = mirror_center - CONTROL_SIZE // 2
+                    mirror_x = mirror_center - mirror_width / 2.0
 
-                    mirror_control.image_position.setX(int(mirror_x))
+                    # round(), not int()/`//`: truncation biases the
+                    # mirror's position left/up by up to half a pixel
+                    # whenever the centering math lands on a .5 remainder,
+                    # so it never quite sits on the true symmetry-line
+                    # reflection of the dragged control's center.
+                    mirror_control.image_position.setX(round(mirror_x))
                     mirror_control.image_position.setY(control.image_position.y())
 
                     mirror_item = controller.find_item(mirror_bone)
@@ -459,9 +718,21 @@ class PickerCanvas(QWidget):
                     btn.hide()
             rows = tuple(row for row in rows if row not in motion_path_rows)
 
-        scale = self.image_scale()
+        # native_image_scale(), not image_scale(): the overlay buttons'
+        # _base_width/_base_height were sized (via adjustSize() at
+        # construction) against the original addon's raw display/native
+        # pixel ratio, not the newer load-baseline-relative image_scale()
+        # used for picker controls - see native_image_scale()'s
+        # docstring for why using image_scale() here made these buttons
+        # balloon on load instead of tracking the image's actual
+        # on-canvas size.
+        scale = self.native_image_scale()
 
-        # Slightly larger than picker controls
+        # Overlay buttons scale with the image like the picker controls
+        # do, but at 2x that rate so they stay comfortably tappable/
+        # legible instead of shrinking down to the same tiny size as a
+        # control - slightly larger than picker controls at any given
+        # image scale.
         button_scale = max(0.1, scale) * 2.0
 
         margin = round(10 * button_scale)
@@ -580,9 +851,16 @@ class PickerCanvas(QWidget):
                 + self.background.height() * self.image_scale()
             )
 
+            # round(), not raw floats: canvas_x/line_bottom are floats
+            # (symmetry_x * a float scale), but QPoint's constructor
+            # expects ints - passing floats here silently aborts the
+            # rest of this paintEvent (Qt/PySide reports the TypeError
+            # to the console, not to the UI), which meant the guide line
+            # (and its triangle handle) never actually got drawn even
+            # once symmetry_x held a correct, on-canvas value.
             painter.drawLine(
-                QPoint(canvas_x, line_top),
-                QPoint(canvas_x, line_bottom)
+                QPoint(round(canvas_x), round(line_top)),
+                QPoint(round(canvas_x), round(line_bottom))
             )
 
             # Draw triangle handle
@@ -640,7 +918,8 @@ class PickerCanvas(QWidget):
                 if nearest:
                     nearest.clicked.emit(
                         nearest.bone_name,
-                        False
+                        False,
+                        False,  # was_drag: this is a direct pick, never a drag
                     )
                     return
 
@@ -648,7 +927,8 @@ class PickerCanvas(QWidget):
                 window = self.window()
                 if hasattr(window, "controller"):
                     window.controller.deselect_all()
-                    window.controller.hide_all()
+
+                controller = getattr(self.window(), "controller", None)
 
                 if self.symmetry_enabled:
                     
@@ -658,11 +938,24 @@ class PickerCanvas(QWidget):
                             event.position().toPoint()
                         )
                     ):
-                        self.dragging_symmetry = True
+                        # Don't snapshot or start dragging yet - wait for
+                        # actual movement (see mouseMoveEvent). A plain
+                        # click on the handle with no drag isn't an edit.
+                        self._pending_drag_start = click_pos
+                        self._pending_drag_kind = "symmetry"
                         return
 
-                self.dragging_image = True
-                self.drag_start = click_pos
+                # Don't snapshot or start dragging yet either - a press on
+                # empty space with a background image loaded used to be
+                # treated as the start of an image drag unconditionally,
+                # so a plain click-to-deselect (no movement at all) still
+                # pushed an undo snapshot, making undo() jump back to that
+                # click instead of the last real edit. Now the snapshot is
+                # deferred to mouseMoveEvent, the moment real movement
+                # crosses the drag threshold.
+                if self.background:
+                    self._pending_drag_start = click_pos
+                    self._pending_drag_kind = "image"
 
         super().mousePressEvent(event)
 
@@ -674,19 +967,110 @@ class PickerCanvas(QWidget):
             self.symmetry_handle_hover = hover
             self.update()
 
+        # A press on the symmetry handle or empty space (with a
+        # background image loaded) is pending until movement actually
+        # crosses the drag threshold - only then does it become a real
+        # drag, and only then is an undo snapshot taken. A plain click
+        # with no movement leaves dragging_symmetry/dragging_image False
+        # and never touches the undo stack.
+        if self._pending_drag_start is not None:
+            moved = event.position().toPoint() - self._pending_drag_start
+            if moved.manhattanLength() < self.DRAG_THRESHOLD:
+                return
+
+            controller = getattr(self.window(), "controller", None)
+            if controller is not None:
+                controller._record_undo_snapshot()
+
+            if self._pending_drag_kind == "symmetry":
+                self.dragging_symmetry = True
+            elif self._pending_drag_kind == "image":
+                self.dragging_image = True
+                self.drag_start = self._pending_drag_start
+
+            self._pending_drag_start = None
+            self._pending_drag_kind = None
+
         if self.dragging_symmetry:
 
             image_x = self.canvas_to_image_position(
                 QPoint(event.position().x(), 0)
             ).x()
 
-            # Keep symmetry line inside the image
+            # Keep symmetry line inside the image. self.background.width()
+            # is the background's raw NATIVE pixel width, but image_x here
+            # (from canvas_to_image_position()) is in the current
+            # canvas-relative image space - typically much smaller, so
+            # this clamp almost never actually triggers. Use the image's
+            # own width converted into that same current image space
+            # instead, matching _ensure_symmetry_default() in
+            # controller.py.
+            image_space_width = self.canvas_to_image_position(
+                QPoint(self.image_x + self.scaled_background().width(), 0)
+            ).x()
             image_x = max(
                 0,
-                min(image_x, self.background.width())
+                min(image_x, image_space_width)
             )
 
-            delta = image_x - self.symmetry_x
+            desired_delta = image_x - self.symmetry_x
+
+            # Dragging the line shifts EVERY control by the same delta
+            # (see the loop below) - so even though the line itself stays
+            # inside the image, controls positioned near the OPPOSITE
+            # edge from whichever direction the line is being dragged
+            # can get pushed straight out of the image once the same
+            # delta is applied to them too. Only the line's own position
+            # was being bounds-checked; the controls being dragged along
+            # with it weren't. If there are no controls yet, there's
+            # nothing this could push out of bounds, so the line is free
+            # to go anywhere within the image as before.
+            controls = (
+                self.control_list.controls.values()
+                if self.control_list is not None
+                else self.findChildren(CircleControl)
+            )
+            controls = list(controls)
+
+            delta = desired_delta
+
+            if controls:
+                from ..backend import control_dimensions
+
+                min_left = None
+                max_right = None
+
+                for control in controls:
+                    width, _height = control_dimensions(
+                        control.size, control.shape
+                    )
+                    left = control.image_position.x()
+                    right = left + width
+
+                    if min_left is None or left < min_left:
+                        min_left = left
+                    if max_right is None or right > max_right:
+                        max_right = right
+
+                # delta can't push the leftmost control's left edge below
+                # 0, and can't push the rightmost control's right edge
+                # past the image's own width.
+                allowed_min_delta = -min_left
+                allowed_max_delta = image_space_width - max_right
+
+                if allowed_min_delta > allowed_max_delta:
+                    # Controls already span (or exceed) the full image
+                    # width - no room to shift them at all without one
+                    # end going out of bounds, so hold the line still
+                    # rather than picking an arbitrary direction.
+                    delta = 0
+                else:
+                    delta = max(
+                        allowed_min_delta,
+                        min(delta, allowed_max_delta)
+                    )
+
+            image_x = self.symmetry_x + delta
 
             self.symmetry_x = image_x
 
@@ -701,12 +1085,6 @@ class PickerCanvas(QWidget):
                 controller.save()
 
             # Move every control by the same amount
-            controls = (
-                self.control_list.controls.values()
-                if self.control_list is not None
-                else self.findChildren(CircleControl)
-            )
-
             for control in controls:
                 control.image_position.setX(
                     control.image_position.x() + delta
@@ -849,6 +1227,12 @@ class PickerCanvas(QWidget):
 
         self.dragging_image = False
         self.dragging_symmetry = False
+
+        # Clear any pending drag that never crossed the threshold (i.e.
+        # this was a plain click, not a drag) so it doesn't leak into
+        # the next press.
+        self._pending_drag_start = None
+        self._pending_drag_kind = None
 
         if was_dragging_image:
             controller = getattr(self.window(), "controller", None)

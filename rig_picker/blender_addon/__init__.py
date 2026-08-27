@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rig Picker",
     "author": "Susmitha",
-    "version": (2, 0, 0),
+    "version": (2, 0, 6),
     "blender": (4, 3, 0),
     "location": "View3D",
     "description": "Floating Rig Picker",
@@ -59,6 +59,7 @@ def register():
     backend._ACTIVE_WINDOW = None
     backend._CACHED_ARM = None
     backend._CACHED_ARM_NAME = None
+    backend._CACHED_ARM_MODE = None
     backend._LAST_SELECTED_BONES = frozenset()
 
     # Force a fresh read of rig_picker_data.json from disk rather than
@@ -96,6 +97,18 @@ def register():
 
 
 def unregister():
+
+    # ----------------------------------------------------
+    # Close the picker window if it's open, before the operator classes
+    # it depends on are unregistered below - see close_picker()'s own
+    # docstring.
+    # ----------------------------------------------------
+    try:
+        from .ui.launcher import close_picker
+        close_picker()
+    except Exception:
+        import traceback
+        traceback.print_exc()
 
     # ----------------------------------------------------
     # Stop watching for armature changes

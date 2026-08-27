@@ -17,7 +17,7 @@ Storage layout (rig_picker_data.json):
                 "label": "hand.L",
                 "x": 120.0,
                 "y": 84.0,
-                "control_size": 36,
+                "control_size": 18,
                 "control_shape": "CIRCLE",
                 "control_color": "GREEN"
             },
@@ -233,15 +233,35 @@ def save_armature_data(armature_name, armature_data):
 
 
 def delete_armature_data(armature_name):
-    """Removes stored data for an armature (e.g. if the user deletes the rig)."""
+    """Removes stored data for an armature (e.g. if the user deletes the
+    rig), including its captured background image file on disk.
+
+    Without also removing the image, every deleted armature left its
+    captured-view PNG behind permanently in IMAGES_FOLDER_NAME - the
+    JSON entry pointing to it was gone, so nothing would ever reference
+    or clean up that file again. Over a long project this silently
+    accumulates one orphaned image per rig ever deleted.
+    """
     data = _load()
 
     if armature_name in data:
+        background = data[armature_name].get("background")
+
         del data[armature_name]
         _flush()
 
-DEFAULT_WINDOW_WIDTH = 360
-DEFAULT_WINDOW_HEIGHT = 500
+        # Removing by whatever path was actually stored (not just
+        # get_image_path(armature_name)) covers the file that's really
+        # referenced even in the unlikely case the two ever diverged.
+        for path in {background, get_image_path(armature_name)}:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError as e:
+                    print(f"[Rig Picker] Could not remove {path}: {e}")
+
+DEFAULT_WINDOW_WIDTH = 330
+DEFAULT_WINDOW_HEIGHT = 580
 
 
 def get_window_size():

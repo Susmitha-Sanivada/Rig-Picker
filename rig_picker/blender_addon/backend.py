@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 import bpy
 from bpy.app.handlers import persistent
@@ -12,6 +13,14 @@ _CACHED_ARM: bpy.types.Object | None = None
 # checks, and comparing by identity would treat that as a "different"
 # armature and trigger a needless reload.
 _CACHED_ARM_NAME: str | None = None
+
+# Mode the cached armature was in as of the last poll. Used to detect an
+# Object Mode -> Pose Mode transition (however it happened - the mode
+# dropdown, Ctrl+Tab, tabbing in the viewport, not just via this addon's
+# own buttons) so leftover pb.select flags from rig generation/editing
+# can be cleared exactly once on entry, instead of silently feeding into
+# Add Selected as if the user had actually selected those bones.
+_CACHED_ARM_MODE: str | None = None
 
 _ACTIVE_CONTROLLER = None
 _ACTIVE_WINDOW = None
@@ -63,21 +72,50 @@ def poll_active_armature():
     context, so the reload can happen directly here - no need to defer it
     another tick.
     """
-    global _CACHED_ARM, _CACHED_ARM_NAME, _LAST_SELECTED_BONES
+    global _CACHED_ARM, _CACHED_ARM_NAME, _LAST_SELECTED_BONES, _CACHED_ARM_MODE
 
     try:
+        # Run every tick, independent of the active-object branches below.
+        # Those only ever call _sync_armature_combo_items() indirectly via
+        # load_armature(), and only when a *different* armature becomes the
+        # newly active object - so a rig getting deleted was missed
+        # whenever nothing else became active afterward (active_object is
+        # None or a non-armature), and also when some other, non-active
+        # armature was the one deleted while the current one stayed active.
+        # Calling it unconditionally here catches both; it's cheap when
+        # nothing changed (one set comparison, early return).
+        if _ACTIVE_CONTROLLER is not None:
+            try:
+                _ACTIVE_CONTROLLER._sync_armature_combo_items()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+
         obj = getattr(bpy.context, "active_object", None)
         if not obj and hasattr(bpy.context, "view_layer"):
             obj = bpy.context.view_layer.objects.active
 
         if obj and obj.type == 'ARMATURE':
-            if obj.name != _CACHED_ARM_NAME:
+            is_new_armature = obj.name != _CACHED_ARM_NAME
+
+            if is_new_armature:
                 _CACHED_ARM = obj
                 _CACHED_ARM_NAME = obj.name
 
                 # New armature - forget the previous armature's selection
                 # so a stale comparison doesn't suppress the first sync.
                 _LAST_SELECTED_BONES = frozenset()
+
+                # Also forget the previous armature's MODE. Without this,
+                # a brand-new armature first seen already in Pose Mode
+                # (e.g. mid rig-generation, or the poll catching it right
+                # after Tab) would inherit the old armature's leftover
+                # _CACHED_ARM_MODE - if that happened to already be
+                # 'POSE', the Object -> Pose check below would see
+                # 'POSE' -> 'POSE' and skip the one-time selection reset
+                # entirely, even though this armature has never been
+                # checked before.
+                _CACHED_ARM_MODE = None
 
                 if _ACTIVE_CONTROLLER is not None:
                     try:
@@ -88,6 +126,38 @@ def poll_active_armature():
             else:
                 # Same armature logically; keep the reference fresh.
                 _CACHED_ARM = obj
+
+            # ----------------------------------------------------
+            # Object Mode -> Pose Mode: reset selection once.
+            #
+            # Freshly generated/edited rigs commonly carry over
+            # pb.select = True on bones the user never actually clicked
+            # (e.g. Rigify leaves internal bones selected as a side
+            # effect of generation). That stale selection is invisible
+            # in Object Mode, then silently feeds Add Selected the
+            # moment Pose Mode is entered. Clearing it exactly on the
+            # Object -> Pose transition (not on every poll, and not on
+            # Pose -> Pose) means it only fires once per switch, and
+            # leaves any selection the user makes afterwards untouched.
+            # A brand-new armature (is_new_armature) is treated the
+            # same way as an Object -> Pose transition below, since
+            # _CACHED_ARM_MODE is None for it and obj.mode could
+            # already be 'POSE' the first time this armature is seen.
+            # ----------------------------------------------------
+            entered_pose_mode = (
+                obj.mode == 'POSE'
+                and _CACHED_ARM_MODE in ('OBJECT', None)
+            )
+
+            if entered_pose_mode and obj.pose is not None:
+                for pb in obj.pose.bones:
+                    # Blender 5.0 moved pose-bone selection from
+                    # Bone.select (bone.select, now removed) to
+                    # PoseBone.select directly.
+                    pb.select = False
+                obj.data.bones.active = None
+
+            _CACHED_ARM_MODE = obj.mode
 
             # ----------------------------------------------------
             # Detect pose-bone selection made in the 3D viewport and
@@ -112,6 +182,7 @@ def poll_active_armature():
         else:
             # No active armature - nothing to compare selection against.
             _LAST_SELECTED_BONES = frozenset()
+            _CACHED_ARM_MODE = None
 
     except Exception:
         import traceback
@@ -208,12 +279,35 @@ def get_3d_override(context, rig):
     return None
 
 
+_MIRROR_RE = re.compile(r"^(.*)\.([LR])(\.\d+)?$")
+
+
 def mirror_name(name):
-    if name.endswith(".L"):
-        return name[:-2] + ".R"
-    if name.endswith(".R"):
-        return name[:-2] + ".L"
-    return None
+    """Returns the mirrored bone name for names ending in .L / .R, including
+    Blender's numbered-duplicate suffix (e.g. "forearm_tweak.L.001" ->
+    "forearm_tweak.R.001"). Returns None if the name has no L/R side."""
+    match = _MIRROR_RE.match(name)
+    if not match:
+        return None
+
+    base, side, suffix = match.groups()
+    mirrored_side = "R" if side == "L" else "L"
+    return f"{base}.{mirrored_side}{suffix or ''}"
+
+
+def control_dimensions(size, shape):
+    """Returns the (width, height) bounding box of a control in image
+    space for the given size/shape. Mirrors CircleControl's own sizing
+    logic (see circle_control.py: set_display_scale), so callers that
+    need to reason about a control's footprint - e.g. to keep its center
+    fixed when size/shape change - stay in sync with what actually gets
+    drawn."""
+    height = size
+    if shape == "RECTANGLE":
+        width = max(14, round(size * 1.6))
+    else:
+        width = size
+    return width, height
 
 
 # ---------------------------------------------------------
