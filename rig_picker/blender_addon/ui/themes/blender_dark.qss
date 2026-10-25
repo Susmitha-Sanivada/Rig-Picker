@@ -6,7 +6,16 @@ QWidget
 {
     background: #222222; /* Darkened from #2f2f2f */
     color: #d7d7d7;
-    font-family: "Segoe UI";
+    font-family: "Inter", "Segoe UI", "Helvetica Neue", "Arial", sans-serif;
+}
+
+/*--------------------------------------------------
+    Picker Canvas
+--------------------------------------------------*/
+
+QWidget#pickerCanvas
+{
+    background-color: #202020;
 }
 
 /*--------------------------------------------------
@@ -15,8 +24,8 @@ QWidget
 
 QPushButton
 {
-    background-color: #3f3f3f;
-    border: 1px solid #5b5b5b;
+    background-color: #1d1d1d;
+    border: 1px solid #3d3d3d;
 
     border-radius: 4px;
 
@@ -30,25 +39,86 @@ QPushButton
 
 QPushButton:hover
 {
-    background-color: #4b4b4b;
-    border: 1px solid #6f6f6f;
+    background-color: #232323;
+    border: 1px solid #3d3d3d;
 }
 
 QPushButton:pressed
 {
-    background-color: #2f2f2f;
-    border: 1px solid #7c7c7c;
+    background-color: #4f86f7;
+    border: 1px solid #4f86f7;
+    color: white;
 }
 
 QPushButton:disabled
 {
-    background-color: #353535;
+    background-color: #2c2c2c;
+    border: 1px solid #333333;
     color: #777777;
 }
 
-/*--------------------------------------------------
-    IK/FK Overlay Buttons
+/* Checked state for checkable buttons - e.g. the custom Toggle action
+   buttons mirrored from the "Snap" panel (see main_window.py's
+   sync_custom_actions()), matching the accent blue already used for
+   the current item in a picker combo's dropdown. */
+QPushButton:checked
+{
+    background-color: #4f86f7;
+    border: 1px solid #4f86f7;
+    color: white;
+}
 
+QPushButton:checked:hover
+{
+    background-color: #5f92f8;
+}
+
+/* Toolbar row only (Capture View / Add Selected / Clear All / Delete,
+   set via main_window.py's setObjectName("toolbarButton")) - background
+   color and no border, per request. Hover/pressed/disabled are restated
+   here so these buttons keep reacting the same way the generic
+   QPushButton above does; without this, the #toolbarButton ID
+   selector's specificity would otherwise "stick" at these values
+   through those states too. */
+QPushButton#toolbarButton
+{
+    background-color: #3d3d3d;
+    border: none;
+}
+
+QPushButton#toolbarButton:hover
+{
+    background-color: #565656;
+    border: none;
+}
+
+QPushButton#toolbarButton:pressed
+{
+    background-color: #4f86f7;
+    border: none;
+}
+
+QPushButton#toolbarButton:disabled
+{
+    background-color: #333333;
+    border: none;
+}
+
+/* Symmetry axis toggle - paired with the MirrorIcon glyph in the
+   checkbox row (see main_window.py) - a little smaller than the
+   generic QPushButton so the "X" sits compactly next to the icon. */
+QPushButton#symmetryToggle
+{
+    min-height: 14px;
+    max-height: 16px;
+    padding: 0px 4px;
+}
+
+/*--------------------------------------------------
+    Custom Action Overlay Buttons
+
+    Used by custom action buttons/toggles on the picker canvas (see
+    custom_actions.py / ui/control_list.py's sync_custom_actions()).
     These are resized dynamically (setFixedSize) based on canvas zoom,
     so they must NOT inherit the generic QPushButton's fixed
     min-height/max-height/padding above - those would clamp the actual
@@ -66,8 +136,21 @@ QPushButton#ikfkOverlayButton
     padding: 0px;
 }
 
-/* Label paired with the Live toggle switch - transparent so it doesn't
-   draw the generic QWidget background as an opaque box over the canvas. */
+/* Disabled canvas button - lighter than the enabled button (#1d1d1d) and
+   clearly lighter than the #202020 canvas, so it neither blends into the
+   background nor looks pressed-in. Dim text marks it as inactive. Applies
+   to the canvas overlay buttons only. Kept above the actionProblem rule
+   below so a misconfigured button still shows its amber border. */
+QPushButton#ikfkOverlayButton:disabled
+{
+    background-color: #262626;
+    border: 1px solid #373737;
+    color: #626262;
+}
+
+/* Label paired with a Toggle action's switch - transparent so it
+   doesn't draw the generic QWidget background as an opaque box over
+   the canvas. */
 QLabel#ikfkOverlayLabel
 {
     background: transparent;
@@ -76,6 +159,21 @@ QLabel#ikfkOverlayLabel
 QLabel#ikfkOverlayLabel:disabled
 {
     color: #6f6f6f;
+}
+
+/* A Quick button/toggle whose configuration can't work - a Multi rule that
+   references bones the rig no longer has, or a Single button holding more
+   than one command (see Controller.refresh_quick_*_action_enabled_states())
+   - amber so it reads as "needs attention", not just "nothing selected".
+   The tooltip says what. */
+QPushButton#ikfkOverlayButton[actionProblem="true"]
+{
+    border: 1px solid #d9822b;
+}
+
+QLabel#ikfkOverlayLabel[actionProblem="true"]
+{
+    color: #e0a030;
 }
 
 /*--------------------------------------------------
@@ -302,4 +400,80 @@ QAbstractItemView QScrollBar:vertical
 QComboBox:focus
 {
     outline:none;
+}
+
+/*--------------------------------------------------
+    Blender CheckBox
+--------------------------------------------------*/
+
+QCheckBox
+{
+    spacing: 6px;
+    color: #d8d8d8;
+    background: transparent;
+}
+
+/* bqt applies its own app-wide stylesheet (blender_stylesheet) to the
+   whole QApplication before this window's setStyleSheet() is applied on
+   top. Qt lets any property a rule here doesn't set explicitly fall
+   through to that outer stylesheet, so without "image: none" and a
+   literal ":unchecked" rule (higher specificity than the bare
+   "::indicator" base), the outer stylesheet's own checkmark icon/border
+   was showing through underneath ours - the "second color"/"border
+   inside it" look. Every property below is set explicitly so nothing
+   leaks through from bqt's stylesheet. */
+QCheckBox::indicator,
+QCheckBox::indicator:unchecked
+{
+    width: 14px;
+    height: 14px;
+
+    border: 1px solid #5b5b5b;
+    border-radius: 3px;
+    margin: 0px;
+    padding: 0px;
+
+    /* Matches QPushButton's resting fill (#3f3f3f) rather than the near-
+       invisible #292929 that used to sit here - against the #222222
+       window background that old fill gave the unchecked box almost no
+       contrast, so it read as a faint smudge instead of a control. */
+    background-color: #3f3f3f;
+    image: none;
+}
+
+QCheckBox::indicator:hover,
+QCheckBox::indicator:unchecked:hover
+{
+    border: 1px solid #7a7a7a;
+    background-color: #4b4b4b;
+    image: none;
+}
+
+QCheckBox::indicator:checked
+{
+    border: 1px solid #4f86f7;
+    background-color: #4f86f7;
+
+    image: url(:/icons/checkmark.svg);
+}
+
+QCheckBox::indicator:checked:hover
+{
+    border: 1px solid #6b9bf9;
+    background-color: #6b9bf9;
+}
+
+QCheckBox::indicator:disabled,
+QCheckBox::indicator:unchecked:disabled
+{
+    border: 1px solid #3a3a3a;
+    background-color: #353535;
+    margin: 0px;
+    padding: 0px;
+    image: none;
+}
+
+QCheckBox:disabled
+{
+    color: #777777;
 }

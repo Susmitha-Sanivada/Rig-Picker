@@ -1,0 +1,17 @@
+# Normalize line endings for this repo. Blender/bpy addons are pure
+# Python + a few text assets (stylesheets, SVGs) - there's no reason
+# any of it should carry CRLF, and a mixed-ending file (CRLF and LF in
+# the same file) produces noisy, hard-to-review diffs on every future
+# edit regardless of which OS or editor made the change.
+* text=auto eol=lf
+
+*.py  text eol=lf
+*.qss text eol=lf
+*.svg text eol=lf
+*.md  text eol=lf
+*.json text eol=lf
+
+# Binary assets - never touched by line-ending normalization.
+*.png binary
+*.zip binary
+

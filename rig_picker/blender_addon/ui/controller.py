@@ -12,11 +12,13 @@ import copy
 import os
 import shutil
 import tempfile
+import time
 from collections import deque
 
 import bpy
 
 from PySide6.QtCore import QPoint
+from PySide6.QtWidgets import QApplication
 
 from .. import json_manager
 from .. import backend
@@ -25,104 +27,27 @@ from .. import backend
 # other operation in between. See Controller.undo_snapshots.
 UNDO_STACK_DEPTH = 18
 
-IK_FK_GROUPS = {
+# How long the "RigPicker Undo: ..." text stays in the 3D viewport header
+# after an undo/redo before the normal header is put back.
+UNDO_HEADER_SECONDS = 4.0
 
-    "upper_arm_parent.L": {
-        "output_bones": [
-            "upper_arm_fk.L",
-            "forearm_fk.L",
-            "hand_fk.L",
-        ],
-        "input_bones": [
-            "upper_arm_ik.L",
-            "MCH-forearm_ik.L",
-            "MCH-upper_arm_ik_target.L",
-        ],
-        "ctrl_bones": [
-            "upper_arm_ik.L",
-            "upper_arm_ik_target.L",
-            "hand_ik.L",
-        ],
-    },
+# Bumped by every undo/redo so only the LATEST one's timer clears the header
+# (an earlier timer firing mid-way through a newer message would wipe it).
+_undo_header_generation = 0
 
-    "upper_arm_parent.R": {
-        "output_bones": [
-            "upper_arm_fk.R",
-            "forearm_fk.R",
-            "hand_fk.R",
-        ],
-        "input_bones": [
-            "upper_arm_ik.R",
-            "MCH-forearm_ik.R",
-            "MCH-upper_arm_ik_target.R",
-        ],
-        "ctrl_bones": [
-            "upper_arm_ik.R",
-            "upper_arm_ik_target.R",
-            "hand_ik.R",
-        ],
-    },
-    "thigh_parent.L": {
-        "output_bones": [
-            "thigh_fk.L",
-            "shin_fk.L",
-            "foot_fk.L",
-            "toe_fk.L",
-        ],
-        "input_bones": [
-            "thigh_ik.L",
-            "MCH-shin_ik.L",
-            "MCH-thigh_ik_target.L",
-        ],
-        "ctrl_bones": [
-            "thigh_ik.L",
-            "thigh_ik_target.L",
-            "foot_ik.L",
-        ],
-
-        "tail_bones": [
-            "toe_ik.L",
-        ],
-
-        "extra_ctrls": [
-            "foot_heel_ik.L",
-            "foot_spin_ik.L",
-        ],
-
-        "heel_control": "foot_heel_ik.L",
-    },
-    "thigh_parent.R": {
-        "output_bones": [
-            "thigh_fk.R",
-            "shin_fk.R",
-            "foot_fk.R",
-            "toe_fk.R",
-        ],
-
-        "input_bones": [
-            "thigh_ik.R",
-            "MCH-shin_ik.R",
-            "MCH-thigh_ik_target.R",
-        ],
-
-        "ctrl_bones": [
-            "thigh_ik.R",
-            "thigh_ik_target.R",
-            "foot_ik.R",
-        ],
-
-        "tail_bones": [
-            "toe_ik.R",
-        ],
-
-        "extra_ctrls": [
-            "foot_heel_ik.R",
-            "foot_spin_ik.R",
-        ],
-
-        "heel_control": "foot_heel_ik.R",
-    },
-}
+# How long a rig has to stay genuinely gone from the file (not merely out
+# of the current view layer) before its saved picker data is purged. Gives
+# Ctrl+Z on an accidental delete a window to bring the rig back with its
+# layout intact.
+# LIMITS: the pending-deletion list (self._pending_armature_deletions) is
+# plain memory. Quitting/crashing Blender inside this window leaves the
+# rig's saved layout, panel rows and multi-command buttons behind (as
+# orphans keyed by the old rig name); a NEW rig that later gets exactly
+# that name would inherit them. A rename is told apart from a deletion via
+# the object's session_uid (see _sync_armature_combo_items()), so a rig
+# that is deleted and then re-created - even under the same name - is a
+# NEW object as far as this code is concerned.
+ARMATURE_DELETE_GRACE_SECONDS = 60
 
 
 class Controller:
@@ -135,6 +60,22 @@ class Controller:
         # Name of the armature the currently-loaded data belongs to.
         self.armature_name = None
 
+        # Name of the panel (Manage Panels N-panel section /
+        # self.window.stale_combo) the currently-loaded data belongs
+        # to. Each panel on a rig keeps its own fully independent
+        # picker data - items, background capture, symmetry, undo/redo
+        # - the same way two different rigs already did before panels
+        # existed; this is the other half of that (rig, panel) key. See
+        # _switch_to_panel() and _snapshot_key().
+        self.panel_name = None
+
+        # The (rig, panel) pair the picker canvas's Quick multi-command
+        # buttons were last filtered for. sync_panel_combo_items() compares
+        # it every poll tick and re-syncs on a mismatch, so the canvas can
+        # never keep showing another panel's buttons no matter which code
+        # path changed self.armature_name/self.panel_name.
+        self._quick_synced_key = None
+
         # Appearance a brand-new control gets (Add Selected) and what
         # the pickers show/enable whenever nothing is selected. Starts
         # at the historical hardcoded values (see json_manager.py's
@@ -145,17 +86,18 @@ class Controller:
         self.default_control_shape = "CIRCLE"
         self.default_control_color = "GREEN"
 
-        # In-memory picker data for the current armature:
+        # In-memory picker data for the current (rig, panel) pair:
         # {"background": str, "symmetry": bool, "symmetry_x": float, "items": [...]}
-        self.data = json_manager.new_armature_data()
+        self.data = json_manager.new_panel_data()
 
-        # Undo: up to UNDO_STACK_DEPTH snapshots per rig, keyed by
-        # armature name, each taken right before an operation (drag,
-        # toggle, selection change, appearance change, IK/FK switch flip,
-        # etc.) on THAT rig changed something. Switching to a different
-        # armature doesn't touch this - each rig keeps its own stack, so
+        # Undo: up to UNDO_STACK_DEPTH snapshots per (rig, panel) pair,
+        # keyed by _snapshot_key(), each taken right before an operation
+        # (drag, toggle, selection change, appearance change, etc.) on
+        # THAT panel changed something. Switching to a different
+        # armature OR a different panel on the same rig doesn't touch
+        # this - each (rig, panel) pair keeps its own stack, so
         # switching away and back and pressing Ctrl+Z behaves exactly as
-        # if no switch had happened in between. Each rig's stack is a
+        # if no switch had happened in between. Each pair's stack is a
         # deque with maxlen=UNDO_STACK_DEPTH: appending past that limit
         # silently drops the oldest entry, so pressing undo repeatedly
         # with no new operations in between walks back up to
@@ -172,7 +114,7 @@ class Controller:
         self.undo_snapshots = {}
 
         # Redo: the exact same structure and depth limit as
-        # self.undo_snapshots, keyed by armature name - undo() pushes
+        # self.undo_snapshots, keyed the same way - undo() pushes
         # onto this every time it pops something, and redo() pushes
         # onto self.undo_snapshots every time IT pops something, so
         # walking back and forth between the two behaves like a normal
@@ -182,6 +124,15 @@ class Controller:
         # system, redoing only makes sense along the exact timeline you
         # just stepped back from.
         self.redo_snapshots = {}
+
+        # Maps each known armature's session_uid (a Blender-assigned
+        # identifier for a datablock that stays the same for its whole
+        # lifetime in this session, unlike its name) to the name it had
+        # as of the last _sync_armature_combo_items() call. Used to tell
+        # "this armature was renamed" apart from "this armature was
+        # deleted and an unrelated one was added" - see
+        # _sync_armature_combo_items()/_handle_armature_renamed().
+        self._known_armature_names_by_uid = {}
 
         # Selection captured by deselect_all() right before it clears
         # self.selected_bones, kept only until the *next* snapshot is
@@ -204,10 +155,24 @@ class Controller:
         # before it was ever used.
         self._undo_backup_counter = 0
 
+        # {armature_name: time.monotonic() deadline} for rigs that vanished
+        # from the scene and are no longer anywhere in bpy.data.objects.
+        # Their saved data is only purged once the deadline passes without
+        # the rig coming back - see _sync_armature_combo_items().
+        self._pending_armature_deletions = {}
+
+        # (rig name, rig session_uid, frozenset of its pose bone names) as of
+        # the last refresh_quick_multi_action_bone_validity() pass - lets
+        # that per-tick check do nothing unless the rig's bones changed.
+        self._quick_bone_fingerprint = None
+
     # ---------------------------------------------------------
 
     def set_window(self, window):
         self.window = window
+        # A new/reopened window has no canvas buttons yet - force the next
+        # poll tick to re-filter for the currently loaded (rig, panel).
+        self._quick_synced_key = None
 
     # ---------------------------------------------------------
     # UNDO
@@ -243,43 +208,150 @@ class Controller:
         return changes if changes else ["no field changes"]
 
     @staticmethod
-    def _capture_pose_transforms(bone_names):
-        """Snapshots location/rotation/scale for each named pose bone,
-        for use as _record_undo_snapshot()'s pose_restore argument.
-        Skips bones that don't exist on the current rig."""
-        rig = backend.arm()
-        if rig is None:
-            return {}
+    def _prune_dead_custom_action_overlay_positions(data):
+        """Drops any `overlay_positions` entry belonging to a Quick
+        Action button that no longer exists in
+        Scene.rp_quick_action_settings.
 
-        captured = {}
-        for name in bone_names:
-            pb = rig.pose.bones.get(name)
-            if pb is None:
+        Removing a Quick Action button goes through Blender's own undo
+        system, not this picker's own undo stack (see
+        custom_actions_quick.py's RP_OT_quick_remove_*_action). That
+        removal's own cleanup deletes the button's saved position from
+        self.data/disk at the time it happens, but a LATER picker-level
+        undo()/redo() can restore an OLDER self.data snapshot - one
+        recorded before that removal - which still has the now-dead
+        button's position entry in it. Left alone, that resurrected
+        entry would get written straight back to disk by the save()
+        undo()/redo() call right after restoring self.data. Called on
+        `data` (either self.data restored by undo()/redo(), or any
+        dict about to become self.data) before that save().
+        """
+        overlay_positions = data.get("overlay_positions")
+        if not overlay_positions:
+            return
+
+        # EVERY scene's buttons count as alive: panel layouts live in the
+        # shared JSON keyed by rig/panel name, so a button that belongs to
+        # a scene other than the open one still owns its saved position.
+        # Checking only bpy.context.scene deleted those positions.
+        live_keys = set()
+        for scene in bpy.data.scenes:
+            quick_settings = getattr(scene, "rp_quick_action_settings", None)
+            if quick_settings is None:
                 continue
-
-            captured[name] = {
-                "rotation_mode": pb.rotation_mode,
-                "location": tuple(pb.location),
-                "rotation_quaternion": tuple(pb.rotation_quaternion),
-                "rotation_euler": tuple(pb.rotation_euler),
-                "scale": tuple(pb.scale),
+            live_keys |= {
+                f"custom_action_quick_multi_{action.uid}"
+                for action in quick_settings.multi_actions
+            }
+            live_keys |= {
+                f"custom_action_quick_single_{action.uid}"
+                for action in quick_settings.single_actions
             }
 
-        return captured
+        for key in list(overlay_positions.keys()):
+            if key.startswith("custom_action_") and key not in live_keys:
+                del overlay_positions[key]
+
+    @staticmethod
+    def _set_viewport_header_text(text):
+        """Sets (or, with None, clears) the text in every 3D viewport's
+        header. Best effort: a window/area can be gone by the time the
+        clear timer fires (file switch, closed window)."""
+        try:
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type == "VIEW_3D":
+                        area.header_text_set(text)
+        except Exception:
+            pass
 
     @staticmethod
     def _show_snapshot_in_viewport(changed):
         """Displays what the last undo restored in the 3D viewport's
         header, purely for visibility into the operation - does not
-        affect what undo() restores or how."""
-        text = f"RigPicker Undo: {', '.join(changed)}"
+        affect what undo() restores or how. The text is shown for
+        UNDO_HEADER_SECONDS and then removed again: header_text_set()
+        replaces the header until it is explicitly reset, so without the
+        timer the message would stay there until Blender restarts."""
+        global _undo_header_generation
 
-        for window in bpy.context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type == "VIEW_3D":
-                    area.header_text_set(text)
+        Controller._set_viewport_header_text(
+            f"RigPicker Undo: {', '.join(changed)}"
+        )
 
-    def _record_undo_snapshot(self, ikfk_restore=None, pose_restore=None, clear_motion_path=False, recalculate_motion_path=False, selection_only=False):
+        _undo_header_generation += 1
+        generation = _undo_header_generation
+
+        def _clear():
+            if generation == _undo_header_generation:
+                Controller._set_viewport_header_text(None)
+            return None
+
+        bpy.app.timers.register(_clear, first_interval=UNDO_HEADER_SECONDS)
+
+    def _snapshot_key(self, armature_name=None, panel_name=None):
+        """The (rig, panel) key undo/redo stacks are keyed by. Defaults
+        to whichever pair is currently loaded; pass explicit values when
+        computing the key for a pair other than the live one (e.g. one
+        being renamed or deleted elsewhere in the scene)."""
+        armature_name = self.armature_name if armature_name is None else armature_name
+        panel_name = self.panel_name if panel_name is None else panel_name
+        return (armature_name or "", panel_name or "")
+
+    def _switch_to_panel(self, panel_name):
+        """Saves whichever panel's data is currently loaded (if any) and
+        loads panel_name's own data - on the CURRENT rig (self.armature_name)
+        - in its place. The panel-level equivalent of load_armature()'s
+        rig-level save-current/load-new swap: a different panel is a
+        completely independent picker layout (its own items, background
+        capture, symmetry - see json_manager's per-panel storage), so
+        nothing carries over across the switch, the same way nothing
+        carries over switching rigs.
+
+        No-ops if panel_name already matches what's loaded, so this is
+        safe to call speculatively (change_panel() calls it immediately
+        for a snappy switch; sync_panel_combo_items() also calls it
+        every poll tick as a safety net) without ever double-loading.
+        Pass None to represent "no panel loaded" (no rig active, or the
+        active rig has no panel selected yet).
+        """
+        if panel_name == self.panel_name:
+            return
+
+        if self.armature_name and self.panel_name:
+            self.save()
+
+        self.panel_name = panel_name
+
+        if self.armature_name and panel_name:
+            stored = json_manager.get_panel_data(self.armature_name, panel_name)
+            self.data = stored if stored is not None else json_manager.new_panel_data()
+        else:
+            self.data = json_manager.new_panel_data()
+
+        # A different panel's items are a wholly separate picker layout -
+        # nothing about the OLD panel's live state belongs here: reset
+        # selection and the "what a new control looks like" defaults
+        # exactly the way load_armature() already does for a rig switch.
+        self.selected_bones = set()
+        self._pending_deselect_baseline = None
+        self._load_panel_defaults()
+
+        if self.window is not None:
+            # Quick multi-command buttons are scoped to (rig, panel), and
+            # PickerCanvas.sync_quick_actions() is the ONLY place that
+            # re-filters the canvas widgets against self.panel_name.
+            # Without this call a panel switch left the previous panel's
+            # buttons on screen (and, right after a rig switch - where
+            # panel_name is still None when that sync runs - left this
+            # panel's own buttons missing). Must run BEFORE refresh() so
+            # refresh() only paints the final, correct set.
+            self.window.sync_quick_actions()
+            self.refresh()
+            self.window.set_no_selection_defaults()
+            self.refresh_custom_action_enabled_states()
+
+    def _record_undo_snapshot(self, selection_only=False, defaults_only=False):
         """Stores everything undo() needs to revert the picker UI to
         exactly how it looked right before the operation that's about
         to happen.
@@ -287,41 +359,9 @@ class Controller:
         Call this once, right before a user-initiated operation starts
         changing anything - e.g. at the start of a drag (not on every
         mouseMoveEvent), before a toggle/appearance/add/delete/selection
-        change is applied, before the IK/FK switch flips a bone's
-        IK_FK value, or before an FK<->IK snap moves bones. Pushes onto
-        this rig's own undo stack (see self.undo_snapshots); once that
-        stack holds UNDO_STACK_DEPTH entries, each further push quietly
-        drops the oldest one.
-
-        ikfk_restore: optional (parent_bone_name, previous_IK_FK_value)
-        tuple - pass this when the operation is about to change a pose
-        bone's "IK_FK" custom property (the IK/FK switch), so undo() can
-        set it back.
-
-        pose_restore: optional {bone_name: {"location": ..., "rotation_quaternion":
-        ..., "rotation_euler": ..., "rotation_mode": ..., "scale": ...}}
-        dict - pass this when the operation is about to move pose bones
-        directly (e.g. an FK<->IK snap), so undo() can put those bones'
-        transforms back. Unlike ikfk_restore (a single custom property),
-        this restores the actual bone pose.
-
-        clear_motion_path: pass True when the operation about to happen
-        is calculating a motion path (rp.calculate_path). Blender draws
-        motion paths from its own per-bone cache, which the picker's
-        data dict knows nothing about, so reverting self.data alone
-        can't make the drawn path disappear - undo() needs to be told
-        to explicitly clear it too (the same as pressing the "x"
-        button).
-
-        recalculate_motion_path: the mirror of clear_motion_path - pass
-        True when the operation about to happen is clearing a motion
-        path (rp.clear_path), so undo() knows to recalculate it rather
-        than leave it cleared. Redo also builds this pairing
-        automatically on whichever mirror entry it constructs for the
-        other stack (see _capture_reverse_entry()), so a redo of a
-        calculate re-calculates it and an undo of a redo-of-a-clear
-        clears it again - passing it explicitly here is only needed for
-        the original, forward push of a genuine clear.
+        change is applied. Pushes onto this rig's own undo stack (see
+        self.undo_snapshots); once that stack holds UNDO_STACK_DEPTH
+        entries, each further push quietly drops the oldest one.
 
         selection_only: pass True when this snapshot is for a plain
         selection change (select_control()/select_all()) rather than a
@@ -341,21 +381,55 @@ class Controller:
         a delete would land on a redundant, do-nothing "reselect
         whatever was selected before you selected the thing you just
         deleted" step instead of the actual prior state.
+
+        defaults_only: pass True when the operation about to happen is
+        _set_selected_appearance()'s "nothing selected" branch - editing
+        the *default* size/shape/color new controls will get, which by
+        definition only happens while there's no selection at all. That
+        makes it a different case from the "toggling something"/
+        "dragging"/"picking a new control" examples above: those
+        continue an interaction with a specific control, so if the
+        picker's current selection happens to be empty only because of
+        an incidental deselect right before them, resurrecting the
+        selection from before that deselect (see selection_for_snapshot
+        below) is the right call. Editing the *default* appearance isn't
+        continuing anything - it's an operation that's only reachable
+        because nothing is selected - so its own undo step should
+        restore selection to genuinely empty (what the canvas actually
+        looked like right before the dropdown was touched), not resurrect
+        whatever was selected before that. Doesn't affect whether a
+        pending deselect still protects the previous entry from being
+        discarded below - that part is unrelated to which selection this
+        particular snapshot restores to.
         """
         stack = self.undo_snapshots.setdefault(
-            self.armature_name, deque(maxlen=UNDO_STACK_DEPTH)
+            self._snapshot_key(), deque(maxlen=UNDO_STACK_DEPTH)
         )
 
         # If the user clicked truly-empty canvas space right before this
         # operation, with nothing else in between, restore selection all
         # the way back to what it was before that deselect - not to the
-        # momentarily-empty state it left behind. The deselect itself was
-        # never treated as an operation, so undo shouldn't land on it.
-        if self._pending_deselect_baseline is not None:
+        # momentarily-empty state it left behind - UNLESS this operation
+        # is itself only possible because nothing is selected
+        # (defaults_only), in which case genuinely-empty IS the correct
+        # state to restore to. The deselect itself was never treated as
+        # an operation, so undo shouldn't land on it either way.
+        #
+        # deselect_was_pending tracks whether a deselect happened here at
+        # all (regardless of defaults_only) - see the stale-entry check
+        # below, which needs to know this too: a deselect having happened
+        # is what makes the previous selection_only entry a genuinely
+        # earlier, distinct state, whether or not THIS particular
+        # snapshot goes on to resurrect it.
+        deselect_was_pending = self._pending_deselect_baseline is not None
+
+        if deselect_was_pending and not defaults_only:
             selection_for_snapshot = self._pending_deselect_baseline
-            self._pending_deselect_baseline = None
         else:
             selection_for_snapshot = self.selected_bones
+
+        if deselect_was_pending:
+            self._pending_deselect_baseline = None
 
         # Nothing was selected right before this pick, so this isn't a
         # switch between two selections - it's the start of one. Skip
@@ -364,15 +438,30 @@ class Controller:
         if selection_only and not selection_for_snapshot:
             return
 
-        # A real operation immediately following a plain selection change
-        # doesn't need that selection change to remain its own separate
-        # undo step - the operation's own snapshot (pushed below) already
-        # captures the live, just-made selection, so the trailing
-        # selection_only entry would only ever be an intermediate, no-op
-        # detour between two states undo already visits.
-        if stack and stack[-1].get("selection_only") and not selection_only:
+        # A real operation immediately following a plain selection change,
+        # with NOTHING ELSE in between, doesn't need that selection change
+        # to remain its own separate undo step - the operation's own
+        # snapshot (pushed below) already captures the live, just-made
+        # selection, so the trailing selection_only entry would only ever
+        # be an intermediate, no-op detour between two states undo already
+        # visits.
+        #
+        # deselect_was_pending being True means that assumption doesn't
+        # hold: a deselect DID happen in between (select control, click
+        # empty canvas, then e.g. change the default shape/size/color
+        # with nothing selected) - that deselect was real, even though it
+        # never pushed its own snapshot, so the selection_only entry still
+        # sitting on top of the stack represents a genuinely earlier,
+        # distinct state, not a redundant detour. Leave it be so undo
+        # steps through it instead of skipping straight past it.
+        if (
+            stack
+            and stack[-1].get("selection_only")
+            and not selection_only
+            and not deselect_was_pending
+        ):
             stale = stack.pop()
-            self._settle_snapshot_pending_image(stale, self.armature_name)
+            self._settle_snapshot_pending_image(stale, self._snapshot_key())
 
         # deque(maxlen=...) auto-evicts the oldest entry once full, but
         # silently - it doesn't hand the evicted item back. Pop it
@@ -382,7 +471,7 @@ class Controller:
         # file on disk that nothing will ever clean up.
         if len(stack) == stack.maxlen:
             evicted = stack.popleft()
-            self._settle_snapshot_pending_image(evicted, self.armature_name)
+            self._settle_snapshot_pending_image(evicted, self._snapshot_key())
 
         # A real, new operation happening now means whatever was
         # previously undone on this rig is no longer reachable by
@@ -392,19 +481,23 @@ class Controller:
         # snapshots still on the redo stack that never got applied are
         # settled here (their staged background-image work, if any, is
         # now permanently moot).
-        stale_redo_stack = self.redo_snapshots.pop(self.armature_name, None)
+        stale_redo_stack = self.redo_snapshots.pop(self._snapshot_key(), None)
         if stale_redo_stack:
             for stale_redo_entry in stale_redo_stack:
-                self._settle_snapshot_pending_image(stale_redo_entry, self.armature_name)
+                self._settle_snapshot_pending_image(stale_redo_entry, self._snapshot_key())
 
         stack.append({
             "data": copy.deepcopy(self.data),
             "selected_bones": set(selection_for_snapshot),
-            "ikfk_restore": ikfk_restore,
-            "pose_restore": pose_restore,
-            "clear_motion_path": clear_motion_path,
-            "recalculate_motion_path": recalculate_motion_path,
             "selection_only": selection_only,
+            # The "what will a newly-added control look like" default -
+            # live Controller state, not part of self.data, so it needs
+            # its own explicit capture here. Captured unconditionally
+            # (like selected_bones above) since it's cheap and any
+            # operation could in principle be the one that changed it.
+            "default_control_size": self.default_control_size,
+            "default_control_shape": self.default_control_shape,
+            "default_control_color": self.default_control_color,
             # Filled in afterward, directly by clear_all()/capture_view()
             # via _current_snapshot(), if this particular operation turns
             # out to be one of those - see that method's docstring.
@@ -424,7 +517,7 @@ class Controller:
         too - not just whichever operation happens to be most recent at
         the time undo() is actually pressed.
         """
-        stack = self.undo_snapshots.get(self.armature_name)
+        stack = self.undo_snapshots.get(self._snapshot_key())
         if not stack:
             return None
         return stack[-1]
@@ -432,41 +525,41 @@ class Controller:
     @staticmethod
     def _redraw_all_areas():
         """Tags every area in every window for a redraw. Pulled out as a
-        helper because several undo-adjacent operations (an IK/FK flip,
-        an FK<->IK snap's pose restore, a plain refresh()) each need one
-        of these after changing pose data, and previously each copied
-        the same loop rather than sharing it."""
+        helper since more than one undo-adjacent operation (a Custom
+        Actions Toggle restore, a plain refresh()) needs one of these
+        after changing pose data, rather than each copying the same
+        loop."""
         for window in bpy.context.window_manager.windows:
             for area in window.screen.areas:
                 area.tag_redraw()
 
-    def _settle_snapshot_pending_image(self, snapshot, armature_name=None):
+    def _settle_snapshot_pending_image(self, snapshot, key=None):
         """Finalizes whatever background-image delete/backup a snapshot
         was carrying, once that snapshot itself is no longer reachable
-        by undo (evicted from a full stack, or the rig it belongs to was
-        deleted from the scene entirely). "Finalizing" a delete means
-        actually performing it; "finalizing" a backup means discarding
-        the backup copy, since the capture that overwrote it is now
-        permanent and can never be undone back to it.
+        by undo (evicted from a full stack, or the (rig, panel) pair it
+        belongs to was deleted from the scene entirely). "Finalizing" a
+        delete means actually performing it; "finalizing" a backup means
+        discarding the backup copy, since the capture that overwrote it
+        is now permanent and can never be undone back to it.
 
-        armature_name: which rig this snapshot belongs to (pass
-        self.armature_name from callers operating on the currently
-        loaded rig's own stack, or the relevant key when iterating
-        self.undo_snapshots/self.redo_snapshots directly). Used to guard
-        against deleting a file that's back in active use - capture_view()
-        always writes to the SAME fixed per-armature path
-        (json_manager.get_image_path()), so "Clear All" (stages the old
-        path for deletion once unreachable) followed by a fresh capture
-        BEFORE that old snapshot ages off the stack reuses that exact
-        path for the new, live image. Without this check, whichever of
-        eviction/rig-deletion/window-close finalized that old snapshot
-        first would delete the file the rig's CURRENT background is
+        key: the (armature_name, panel_name) pair this snapshot belongs
+        to (pass self._snapshot_key() from callers operating on the
+        currently loaded pair's own stack, or the relevant key when
+        iterating self.undo_snapshots/self.redo_snapshots directly).
+        Used to guard against deleting a file that's back in active use -
+        capture_view() always writes to the SAME fixed per-(rig, panel)
+        path (json_manager.get_image_path()), so "Clear All" (stages the
+        old path for deletion once unreachable) followed by a fresh
+        capture BEFORE that old snapshot ages off the stack reuses that
+        exact path for the new, live image. Without this check, whichever
+        of eviction/deletion/window-close finalized that old snapshot
+        first would delete the file the panel's CURRENT background is
         actively pointing at - invisible for the rest of the session
         (Qt already has the pixels loaded in memory), but gone the next
-        time this rig's data is loaded from disk. If armature_name isn't
-        given, this check is skipped (safe for backup paths, which are
-        always uniquely suffixed per-operation and never collide with a
-        live path anyway).
+        time this panel's data is loaded from disk. If key isn't given,
+        this check is skipped (safe for backup paths, which are always
+        uniquely suffixed per-operation and never collide with a live
+        path anyway).
         """
         if snapshot is None:
             return
@@ -474,8 +567,8 @@ class Controller:
         image_path = snapshot.get("pending_image_delete")
         if image_path:
             still_live = False
-            if armature_name:
-                current = json_manager.get_armature_data(armature_name)
+            if key and key[0] and key[1]:
+                current = json_manager.get_panel_data(key[0], key[1])
                 if current and current.get("background") == image_path:
                     still_live = True
 
@@ -510,14 +603,14 @@ class Controller:
         undone) would leave an orphaned "<path>.undo_backup_N" file on
         disk forever, or fail to actually remove a background clear_all()
         had staged for deletion."""
-        for armature_name, stack in self.undo_snapshots.items():
+        for key, stack in self.undo_snapshots.items():
             for snapshot in stack:
-                self._settle_snapshot_pending_image(snapshot, armature_name)
+                self._settle_snapshot_pending_image(snapshot, key)
         self.undo_snapshots.clear()
 
-        for armature_name, stack in self.redo_snapshots.items():
+        for key, stack in self.redo_snapshots.items():
             for snapshot in stack:
-                self._settle_snapshot_pending_image(snapshot, armature_name)
+                self._settle_snapshot_pending_image(snapshot, key)
         self.redo_snapshots.clear()
 
     def _stage_image_backup(self, dest_path):
@@ -589,39 +682,16 @@ class Controller:
         reverse_entry = {
             "data": copy.deepcopy(self.data),
             "selected_bones": set(self.selected_bones),
-            "ikfk_restore": None,
-            "pose_restore": None,
-            "clear_motion_path": False,
-            "recalculate_motion_path": False,
             "selection_only": snapshot.get("selection_only", False),
             "pending_image_delete": None,
             "pending_image_backup": None,
+            # Mirror of default_control_size/shape/color below - capture
+            # the CURRENT live values before snapshot's own values
+            # overwrite them, so reversing this step later restores them.
+            "default_control_size": self.default_control_size,
+            "default_control_shape": self.default_control_shape,
+            "default_control_color": self.default_control_color,
         }
-
-        # ikfk_restore mirror: capture the CURRENT IK_FK value for the
-        # same bone before snapshot's own value overwrites it below, so
-        # reversing this step later can put it back.
-        if snapshot.get("ikfk_restore") is not None:
-            parent_bone, _ = snapshot["ikfk_restore"]
-            rig = backend.arm()
-            if rig is not None:
-                pb = rig.pose.bones.get(parent_bone)
-                if pb is not None and "IK_FK" in pb:
-                    reverse_entry["ikfk_restore"] = (parent_bone, float(pb["IK_FK"]))
-
-        # pose_restore mirror: same idea, for the same set of bones.
-        if snapshot.get("pose_restore"):
-            reverse_entry["pose_restore"] = self._capture_pose_transforms(
-                list(snapshot["pose_restore"].keys())
-            )
-
-        # Motion path: whichever direction snapshot is about to go
-        # (clear or recalculate), reversing it later needs to do the
-        # opposite.
-        if snapshot.get("clear_motion_path"):
-            reverse_entry["recalculate_motion_path"] = True
-        if snapshot.get("recalculate_motion_path"):
-            reverse_entry["clear_motion_path"] = True
 
         # Background image pixel-content mirror (capture_view() case:
         # same file path, different bytes on disk) - back up whatever's
@@ -655,6 +725,70 @@ class Controller:
 
         return reverse_entry
 
+    def stash_rig_history(self, rig_name):
+        """Removes every (rig, panel) undo/redo stack belonging to
+        `rig_name` from the live dicts and returns them as
+        {"undo": {key: stack}, "redo": {key: stack}} WITHOUT settling their
+        staged image work (the caller either parks them, to be restored
+        later, or hands them to settle_rig_history())."""
+        history = {"undo": {}, "redo": {}}
+        for which, stacks_dict in (("undo", self.undo_snapshots),
+                                   ("redo", self.redo_snapshots)):
+            for key in [k for k in stacks_dict if k[0] == rig_name]:
+                history[which][key] = stacks_dict.pop(key)
+        return history
+
+    def settle_rig_history(self, history):
+        """Finalizes the staged image work of a stashed history that will
+        never be restored (see stash_rig_history())."""
+        if not history:
+            return
+        for stacks in history.values():
+            for key, stack in stacks.items():
+                for snapshot in stack:
+                    self._settle_snapshot_pending_image(snapshot, key)
+
+    def restore_rig_history(self, rig_name, history):
+        """Puts a stashed history back. Whatever stacks `rig_name` has
+        accumulated in the meantime (the fresh default panel's, while the
+        rig was cleared) belong to a state that is going away, so they are
+        settled and replaced - the pre-clear timeline wins."""
+        self.settle_rig_history(self.stash_rig_history(rig_name))
+        if not history:
+            return
+        self.undo_snapshots.update(history.get("undo", {}))
+        self.redo_snapshots.update(history.get("redo", {}))
+
+    def stash_panel_history(self, key):
+        """Removes ONE (rig, panel) pair's undo/redo stacks from the live
+        dicts and returns {"undo": stack|None, "redo": stack|None},
+        without settling their staged image work. Used while a removed
+        panel's removal can still be undone (see
+        custom_actions_quick._PENDING_PANEL_HISTORY)."""
+        return {
+            "undo": self.undo_snapshots.pop(key, None),
+            "redo": self.redo_snapshots.pop(key, None),
+        }
+
+    def settle_panel_history(self, key, parked):
+        """Finalizes the staged image work of a stashed panel history that
+        will never be restored."""
+        for stack in (parked or {}).values():
+            for snapshot in stack or ():
+                self._settle_snapshot_pending_image(snapshot, key)
+
+    def restore_panel_history(self, key, parked):
+        """Puts a stashed panel history back. Anything the pair has
+        accumulated since (a panel of the same name created meanwhile) is
+        settled and replaced - the original timeline wins."""
+        self.settle_panel_history(key, self.stash_panel_history(key))
+        if not parked:
+            return
+        if parked.get("undo"):
+            self.undo_snapshots[key] = parked["undo"]
+        if parked.get("redo"):
+            self.redo_snapshots[key] = parked["redo"]
+
     def _push_reverse_entry(self, stacks_dict, entry):
         """Pushes `entry` onto this rig's stack within `stacks_dict`
         (either self.undo_snapshots or self.redo_snapshots), applying
@@ -663,20 +797,60 @@ class Controller:
         consistent with it instead of duplicating the eviction logic a
         third time."""
         stack = stacks_dict.setdefault(
-            self.armature_name, deque(maxlen=UNDO_STACK_DEPTH)
+            self._snapshot_key(), deque(maxlen=UNDO_STACK_DEPTH)
         )
         if len(stack) == stack.maxlen:
             evicted = stack.popleft()
-            self._settle_snapshot_pending_image(evicted, self.armature_name)
+            self._settle_snapshot_pending_image(evicted, self._snapshot_key())
         stack.append(entry)
 
-    def undo(self):
+    def _visible_selected_bones(self, names):
+        """Filters a candidate set of bone names down to ones whose
+        bone collection is actually visible right now (see backend.
+        is_bone_collection_visible()). Used wherever a selection is
+        being *restored* from stored state (undo/redo snapshots)
+        rather than coming fresh from a live click or the viewport -
+        an undo landing on a snapshot that selected a bone whose
+        collection has since been hidden would otherwise mark that
+        control active in the picker immediately, only to have the
+        next poll tick silently shrink it back down once it notices
+        Blender's own selection doesn't actually include it.
+
+        A bone that no longer exists on the current rig at all (not a
+        visibility question) is left untouched here - current_bone_names
+        intersection at each call site already handles that.
+        """
+        from .. import backend as _backend
+
+        rig = _backend.arm()
+        if not rig or rig.type != "ARMATURE":
+            return set(names)
+
+        return {
+            name for name in names
+            if name not in rig.pose.bones
+            or _backend.is_bone_collection_visible(rig.pose.bones[name])
+        }
+
+    def _interrupted_by_drag(self):
+        """True when an undo/redo request was consumed by a drag or G grab
+        that is in progress, so the caller must do nothing further. Every
+        entry point (the picker window's Ctrl+Z / Ctrl+Shift+Z, and the
+        Blender keymap guard while the cursor is over the picker) comes
+        through undo()/redo(), so this is the one place that decides.
+
+        Ctrl+Z mid-grab CANCELS the grab (what Esc does) and is not an
+        undo step; mid-mouse-drag it is ignored. See
+        PickerCanvas.interrupt_for_undo()."""
+        canvas = getattr(getattr(self.window, "control_list", None), "container", None)
+        return bool(canvas is not None and canvas.interrupt_for_undo())
+
+    def undo(self, discard_redo=False):
         """Reverts the current rig's picker UI to exactly how it looked
         right before the most recent still-remembered operation on THIS
         rig: picker data (control positions, appearance, symmetry,
-        background, checkboxes, ...), the current control selection/
-        highlighting, and - if that operation was flipping the IK/FK
-        switch - the affected bone's IK_FK value.
+        background, checkboxes, ...) and the current control selection/
+        highlighting.
 
         Each rig keeps its own undo stack, up to UNDO_STACK_DEPTH entries
         deep (see self.undo_snapshots) - switching to a different
@@ -692,18 +866,46 @@ class Controller:
         (Ctrl+Shift+Z) can bring it right back - unless a genuine new
         operation happens first, which clears that redo history (see
         _record_undo_snapshot()).
+
+        discard_redo: pass True when this undo is a CANCEL of an operation
+        that was never committed (Esc / right-click during a G grab), not
+        a step the user took back. Nothing is pushed onto the redo stack
+        then, so Ctrl+Shift+Z can't re-apply a move that was cancelled.
+
+        A real undo requested while a drag/grab is in progress is not an
+        undo at all: see _interrupted_by_drag().
         """
-        stack = self.undo_snapshots.get(self.armature_name)
+        if not discard_redo and self._interrupted_by_drag():
+            return
+        stack = self.undo_snapshots.get(self._snapshot_key())
+        if not stack and discard_redo:
+            # A cancel only ever reverts the snapshot its own first
+            # movement recorded; with none left there is nothing to cancel,
+            # and it must never fall through to undoing a Clear All.
+            return
         if not stack:
+            # Nothing left on the picker's own undo stack. The one thing
+            # that can still be undone from here is this rig's Clear All
+            # (its panel rows are scene data; see clear_all()). Anything
+            # else: do nothing - Ctrl+Z over the picker must never be
+            # forwarded to Blender's global undo for other edits.
+            entry = self._clear_all_entry("cleared")
+            if entry is not None:
+                from .. import custom_actions_quick
+                custom_actions_quick.undo_rig_clear(entry)
+            else:
+                print("Rig Picker: nothing to undo in the picker.")
             return
 
         snapshot = stack.pop()
 
         # Capture the mirror-image redo entry from the CURRENT live
-        # state before anything below changes it.
-        self._push_reverse_entry(
-            self.redo_snapshots, self._capture_reverse_entry(snapshot)
-        )
+        # state before anything below changes it - unless this undo is
+        # only cancelling an uncommitted operation (see discard_redo).
+        if not discard_redo:
+            self._push_reverse_entry(
+                self.redo_snapshots, self._capture_reverse_entry(snapshot)
+            )
 
         # Whatever's being undone is no longer eligible for its own
         # background image to be deleted (if it was clear_all(), the
@@ -724,63 +926,34 @@ class Controller:
         changed = self._diff_items(self.data, snapshot["data"])
 
         self.data = snapshot["data"]
+        self._prune_dead_custom_action_overlay_positions(self.data)
         self.save()
         self.refresh()
 
         self._show_snapshot_in_viewport(changed)
 
-        ikfk_restore = snapshot["ikfk_restore"]
-        if ikfk_restore is not None:
-            parent_bone, prev_value = ikfk_restore
+        # Picker undo/redo only touches the picker's own layout data. It
+        # deliberately does NOT write anything back into Blender (Quick
+        # Action toggle values, N-panel buttons): those are Blender changes
+        # and are undone with Blender's own undo.
 
-            rig = backend.arm()
-            if rig is not None:
-                pb = rig.pose.bones.get(parent_bone)
-
-                if pb is not None and "IK_FK" in pb:
-                    pb["IK_FK"] = prev_value
-
-                    pb.keyframe_insert(
-                        data_path='["IK_FK"]',
-                        frame=bpy.context.scene.frame_current
-                    )
-
-                    rig.update_tag(refresh={'DATA'})
-                    bpy.context.view_layer.update()
-
-                    self._redraw_all_areas()
-
-        pose_restore = snapshot.get("pose_restore")
-        if pose_restore:
-            rig = backend.arm()
-            if rig is not None:
-                for bone_name, xform in pose_restore.items():
-                    pb = rig.pose.bones.get(bone_name)
-                    if pb is None:
-                        continue
-
-                    pb.rotation_mode = xform["rotation_mode"]
-                    pb.location = xform["location"]
-                    pb.rotation_quaternion = xform["rotation_quaternion"]
-                    pb.rotation_euler = xform["rotation_euler"]
-                    pb.scale = xform["scale"]
-
-                    frame = bpy.context.scene.frame_current
-                    pb.keyframe_insert(data_path="location", frame=frame)
-                    pb.keyframe_insert(data_path="rotation_quaternion", frame=frame)
-                    pb.keyframe_insert(data_path="rotation_euler", frame=frame)
-                    pb.keyframe_insert(data_path="scale", frame=frame)
-
-                rig.update_tag(refresh={'DATA'})
-                bpy.context.view_layer.update()
-
-                self._redraw_all_areas()
+        # Restore the "what will a newly-added control look like"
+        # default too - live Controller state, not part of self.data,
+        # so self.data above doesn't already cover it. Set before the
+        # set_no_selection_defaults() call below, which reads these
+        # three attributes live.
+        self.default_control_size = snapshot["default_control_size"]
+        self.default_control_shape = snapshot["default_control_shape"]
+        self.default_control_color = snapshot["default_control_color"]
+        self._save_panel_defaults()
 
         # Restore which controls were selected/highlighted. Drop any
         # bone that no longer exists as a control post-restore (e.g. an
         # add/delete was what's being undone).
         current_bone_names = {item["bone_name"] for item in self.data["items"]}
-        self.selected_bones = snapshot["selected_bones"] & current_bone_names
+        self.selected_bones = self._visible_selected_bones(
+            snapshot["selected_bones"] & current_bone_names
+        )
 
         if self.window is not None:
             for name, widget in self.window.control_list.controls.items():
@@ -809,30 +982,7 @@ class Controller:
 
         self._sync_viewport_selection()
 
-        # If what's being undone was a "Calculate" motion-path press,
-        # also do what the "x" (clear) button does - Blender's drawn
-        # motion path lives in its own per-bone cache, separate from
-        # the picker data restored above, so it won't disappear from
-        # the viewport unless we clear it explicitly here too.
-        if snapshot.get("clear_motion_path"):
-            try:
-                bpy.ops.rp.clear_path()
-            except Exception:
-                import traceback
-                traceback.print_exc()
-
-        # The mirror-image case: this snapshot came from redo()'s own
-        # push (see _capture_reverse_entry()) because what's being
-        # undone right now was itself a redo of a "Calculate" press -
-        # recalculate the path rather than leaving it cleared.
-        if snapshot.get("recalculate_motion_path"):
-            try:
-                bpy.ops.rp.calculate_path()
-            except Exception:
-                import traceback
-                traceback.print_exc()
-
-        self.refresh_ikfk_label()
+        self.refresh_custom_action_enabled_states()
 
     def redo(self):
         """The Ctrl+Shift+Z counterpart to undo() - re-applies whatever
@@ -844,13 +994,24 @@ class Controller:
         back from).
 
         Mirrors undo() in every respect - same per-rig stack depth,
-        same ikfk_restore/pose_restore/motion-path/background-image
-        handling, same selection restore - just walking forward instead
-        of back. Every step taken forward is pushed onto this rig's
-        undo stack first, so undo() can immediately reverse it again.
+        same background-image handling, same selection restore - just
+        walking forward instead of back. Every step taken forward is
+        pushed onto this rig's undo stack first, so undo() can
+        immediately reverse it again.
+
+        Like undo(), does nothing while a drag/grab is in progress (see
+        _interrupted_by_drag()).
         """
-        stack = self.redo_snapshots.get(self.armature_name)
+        if self._interrupted_by_drag():
+            return
+        stack = self.redo_snapshots.get(self._snapshot_key())
         if not stack:
+            # Nothing left on the picker's own redo stack: only a Clear All
+            # that was just undone can be redone (see undo()).
+            entry = self._clear_all_entry("undone")
+            if entry is not None:
+                from .. import custom_actions_quick
+                custom_actions_quick.redo_rig_clear(entry)
             return
 
         snapshot = stack.pop()
@@ -865,60 +1026,26 @@ class Controller:
         changed = self._diff_items(self.data, snapshot["data"])
 
         self.data = snapshot["data"]
+        self._prune_dead_custom_action_overlay_positions(self.data)
         self.save()
         self.refresh()
 
         self._show_snapshot_in_viewport(changed)
 
-        ikfk_restore = snapshot.get("ikfk_restore")
-        if ikfk_restore is not None:
-            parent_bone, value = ikfk_restore
+        # Picker undo/redo only touches the picker's own layout data. It
+        # deliberately does NOT write anything back into Blender (Quick
+        # Action toggle values, N-panel buttons): those are Blender changes
+        # and are undone with Blender's own undo.
 
-            rig = backend.arm()
-            if rig is not None:
-                pb = rig.pose.bones.get(parent_bone)
-
-                if pb is not None and "IK_FK" in pb:
-                    pb["IK_FK"] = value
-
-                    pb.keyframe_insert(
-                        data_path='["IK_FK"]',
-                        frame=bpy.context.scene.frame_current
-                    )
-
-                    rig.update_tag(refresh={'DATA'})
-                    bpy.context.view_layer.update()
-
-                    self._redraw_all_areas()
-
-        pose_restore = snapshot.get("pose_restore")
-        if pose_restore:
-            rig = backend.arm()
-            if rig is not None:
-                for bone_name, xform in pose_restore.items():
-                    pb = rig.pose.bones.get(bone_name)
-                    if pb is None:
-                        continue
-
-                    pb.rotation_mode = xform["rotation_mode"]
-                    pb.location = xform["location"]
-                    pb.rotation_quaternion = xform["rotation_quaternion"]
-                    pb.rotation_euler = xform["rotation_euler"]
-                    pb.scale = xform["scale"]
-
-                    frame = bpy.context.scene.frame_current
-                    pb.keyframe_insert(data_path="location", frame=frame)
-                    pb.keyframe_insert(data_path="rotation_quaternion", frame=frame)
-                    pb.keyframe_insert(data_path="rotation_euler", frame=frame)
-                    pb.keyframe_insert(data_path="scale", frame=frame)
-
-                rig.update_tag(refresh={'DATA'})
-                bpy.context.view_layer.update()
-
-                self._redraw_all_areas()
+        self.default_control_size = snapshot["default_control_size"]
+        self.default_control_shape = snapshot["default_control_shape"]
+        self.default_control_color = snapshot["default_control_color"]
+        self._save_panel_defaults()
 
         current_bone_names = {item["bone_name"] for item in self.data["items"]}
-        self.selected_bones = snapshot["selected_bones"] & current_bone_names
+        self.selected_bones = self._visible_selected_bones(
+            snapshot["selected_bones"] & current_bone_names
+        )
 
         if self.window is not None:
             for name, widget in self.window.control_list.controls.items():
@@ -942,85 +1069,96 @@ class Controller:
 
         self._sync_viewport_selection()
 
-        if snapshot.get("clear_motion_path"):
-            try:
-                bpy.ops.rp.clear_path()
-            except Exception:
-                import traceback
-                traceback.print_exc()
-
-        if snapshot.get("recalculate_motion_path"):
-            try:
-                bpy.ops.rp.calculate_path()
-            except Exception:
-                import traceback
-                traceback.print_exc()
-
-        self.refresh_ikfk_label()
+        self.refresh_custom_action_enabled_states()
 
     def _sync_viewport_selection(self):
-        """Pushes self.selected_bones onto the actual viewport selection
-        by reusing the same operator select_control() relies on (rp.select)
-        - rather than re-implementing bone-selection logic here."""
+        """Pushes self.selected_bones onto the actual viewport selection.
+
+        Does exactly ONE reveal/deselect/hide/redraw pass for the whole
+        selection - setting every target bone's pb.select directly -
+        instead of calling bpy.ops.rp.select() once per bone. Each of
+        those per-bone operator calls redid that entire reveal/
+        deselect/hide/redraw cycle on its own (plus its own undo push,
+        depsgraph update and viewport redraw), which is fine for a
+        single click but scales linearly with the number of selected
+        controls - so a box select or an undo/redo landing on a multi-
+        control selection got visibly slower the more controls were
+        involved, even though the end result is exactly the same set
+        of bones selected either way.
+        """
         try:
-            selected = list(self.selected_bones)
+            from ..backend import (
+                arm,
+                get_3d_override,
+                ensure_pose_mode,
+                is_bone_collection_visible,
+                refresh_3d_view,
+            )
 
-            if not selected:
-                # Just deselect - this used to call bpy.ops.rp.hide_all(),
-                # which doesn't just clear the selection, it hides every
-                # pose bone in the viewport. Hiding bones should only ever
-                # happen from the explicit "H" hotkey/Hide All action, not
-                # as a side effect of an undo landing on an empty
-                # selection.
-                from ..backend import arm, get_3d_override, ensure_pose_mode
-
-                rig = arm()
-                if rig and rig.type == "ARMATURE":
-                    override = get_3d_override(bpy.context, rig)
-                    if override:
-                        with bpy.context.temp_override(**override):
-                            # rp.select (used by the non-empty branch
-                            # below) always sets this explicitly before
-                            # calling ensure_pose_mode() - the
-                            # "active_object" key in the override dict
-                            # alone isn't enough for mode_set()/
-                            # select_all()'s polls to reliably pick up
-                            # the rig as active. Without it, both calls
-                            # can silently no-op (CANCELLED, no
-                            # exception) if the rig wasn't already the
-                            # "real" active object at this exact moment -
-                            # leaving the previous selection stuck in the
-                            # viewport even though the picker UI already
-                            # shows nothing selected.
-                            bpy.context.view_layer.objects.active = rig
-                            ensure_pose_mode(bpy.context, rig)
-
-                            # Whenever a control WAS selected, rp.select
-                            # (below) hides every other bone via
-                            # pose.hide(unselected=True) to "solo" it in
-                            # the viewport. Landing back on an empty
-                            # selection needs to undo that explicitly -
-                            # without this reveal, any bone that a prior
-                            # selection hid stayed hidden forever, even
-                            # though the picker UI now shows nothing
-                            # selected (same "show all" behavior
-                            # deselect_all()/_show_all_and_deselect()
-                            # already give via rp.show_all()).
-                            bpy.ops.pose.reveal(select=False)
-                            bpy.ops.pose.select_all(action="DESELECT")
-                        rig.data.bones.active = None
-
+            rig = arm()
+            if not rig or rig.type != "ARMATURE":
                 backend._LAST_SELECTED_BONES = frozenset()
                 return
 
-            # First bone resets selection to just itself (shift=False);
-            # each subsequent bone is added on top (shift=True) - the
-            # same sequence a user gets from clicking one control, then
-            # shift-clicking the rest.
-            for i, name in enumerate(selected):
-                bpy.ops.rp.select(bone_name=name, shift=(i > 0))
+            override = get_3d_override(bpy.context, rig)
+            if not override:
+                return
 
-            backend._LAST_SELECTED_BONES = frozenset(self.selected_bones)
+            # Same visibility guard RP_OT_Select's own shift-branch
+            # applied per bone (see backend.py) - a bone sitting in a
+            # currently-hidden collection can't really be selected in
+            # the viewport, so it's dropped here rather than fed into
+            # pb.select below. Checked once for the whole batch instead
+            # of once per operator call.
+            valid_selected = [
+                name for name in self.selected_bones
+                if name in rig.pose.bones
+                and is_bone_collection_visible(rig.pose.bones[name])
+            ]
+
+            with bpy.context.temp_override(**override):
+                # rp.select always sets this explicitly before calling
+                # ensure_pose_mode() - the "active_object" key in the
+                # override dict alone isn't enough for mode_set()/
+                # select_all()'s polls to reliably pick up the rig as
+                # active. Without it, both calls can silently no-op
+                # (CANCELLED, no exception) if the rig wasn't already
+                # the "real" active object at this exact moment.
+                bpy.context.view_layer.objects.active = rig
+                ensure_pose_mode(bpy.context, rig)
+
+                # Reveal everything, then clear the selection ONCE for
+                # the whole batch (not once per bone) before applying
+                # the actual target selection below.
+                bpy.ops.pose.reveal(select=False)
+                bpy.ops.pose.select_all(action="DESELECT")
+
+                if valid_selected:
+                    for name in valid_selected:
+                        rig.pose.bones[name].select = True
+
+                    # Arbitrary but stable pick for "active" (order
+                    # isn't otherwise meaningful in a set) - matches
+                    # what the old per-bone loop left active, since its
+                    # final call's own bone_name always ended up being
+                    # the one still in selected_bones at that point.
+                    active_name = valid_selected[-1]
+                    rig.data.bones.active = rig.pose.bones[active_name].bone
+
+                    bpy.ops.pose.hide(unselected=True)
+                else:
+                    # Nothing selected means nothing to isolate - the
+                    # pose.reveal(select=False) above already left every
+                    # bone visible, so just leave it that way. (This used
+                    # to select every bone and then hide(unselected=False),
+                    # which hides whatever's selected - i.e. it hid every
+                    # bone in the rig, making them look deleted in the
+                    # viewport.)
+                    rig.data.bones.active = None
+
+            refresh_3d_view(bpy.context)
+
+            backend._LAST_SELECTED_BONES = frozenset(valid_selected)
 
         except Exception:
             import traceback
@@ -1033,20 +1171,11 @@ class Controller:
     def _armature_is_hidden(self, obj):
         """True if this armature is currently hidden in the viewport
         (the eye-icon / H-key hide toggle - bpy's hide_get()/hide_set()).
-        Used to grey out hidden rigs in the dropdown rather than remove
-        them outright, since a hidden rig's picker data (controls,
-        background, etc.) is still perfectly valid - it just can't be
-        made active/selected in the viewport while hidden, which is what
-        change_armature() needs to do.
+        Hidden rigs are left out of the Rig dropdown entirely (their saved
+        picker data is untouched - they simply reappear in the list when
+        shown again).
         """
-        try:
-            return obj.hide_get()
-        except (AttributeError, RuntimeError):
-            # hide_get() can raise if the object isn't in the current
-            # view layer at all - treat that as "not selectable" too,
-            # though _sync_armature_combo_items() already filters those
-            # out of the list entirely before this ever gets called.
-            return False
+        return not backend.is_rig_visible(obj)
 
     def _set_combo_item_enabled(self, combo, index, enabled):
         """Greys out (but doesn't remove) a QComboBox entry. addItem()
@@ -1071,6 +1200,318 @@ class Controller:
             obj = armature_objects.get(combo.itemText(i))
             hidden = obj is not None and self._armature_is_hidden(obj)
             self._set_combo_item_enabled(combo, i, not hidden)
+
+    def _handle_armature_renamed(self, old_name, new_name):
+        """Migrates a tracked armature's saved state from old_name to
+        new_name after Blender itself renamed the underlying object
+        (Outliner, F2, the Properties panel, etc. - anything other than
+        this addon, which never renames an armature on its own).
+
+        Called from _sync_armature_combo_items() once it's confirmed
+        (via session_uid) that this is the same rig as before, just
+        under a new name - so this Controller's in-memory undo/redo
+        history and the combo entry itself need to follow the rename
+        rather than the old name being treated as deleted. (The saved
+        layouts and scene data are migrated before this, see below.)
+        """
+        # The rig's saved layouts (rig_picker_data.json), the Quick
+        # multi-command buttons and Manage Panels rows (every scene) and
+        # custom_actions_quick's session memory have ALREADY been moved by
+        # custom_actions_quick.migrate_rig_renames(), which
+        # _sync_armature_combo_items() runs for the whole batch of renames
+        # before calling this once per pair - doing it there, not here, is
+        # what lets two rigs swapping names be migrated safely. What's left
+        # is this Controller's own state.
+        if self.armature_name == old_name:
+            self.armature_name = new_name
+            # Keeps backend.arm()/poll_active_armature() from seeing a
+            # name mismatch on the very next check and mistaking this
+            # rename for the active object switching to a different
+            # armature entirely (which would reload a blank picker for
+            # "new_name" instead of recognizing it as the rig already
+            # loaded).
+            if backend._CACHED_ARM_NAME == old_name:
+                backend._CACHED_ARM_NAME = new_name
+
+        # Each (rig, panel) pair's undo/redo stack is keyed by
+        # _snapshot_key() (see self.undo_snapshots' docstring) - move
+        # every one of this rig's own pairs over (whichever panel each
+        # key's second element names) so Ctrl+Z still finds them under
+        # the rig's new name instead of becoming unreachable dead weight
+        # in the dict forever.
+        for stacks_dict in (self.undo_snapshots, self.redo_snapshots):
+            for key in [k for k in stacks_dict if k[0] == old_name]:
+                stacks_dict[(new_name, key[1])] = stacks_dict.pop(key)
+
+        # Rename the existing combo entry in place rather than letting
+        # the caller's normal add/remove diffing handle it - that would
+        # drop the item and re-add it at a new sorted position, which is
+        # harmless here but also unnecessary now that the data itself
+        # has already safely followed the rename.
+        if self.window is not None:
+            combo = self.window.armature_combo
+            for i in range(combo.count()):
+                if combo.itemText(i) == old_name:
+                    combo.blockSignals(True)
+                    combo.setItemText(i, new_name)
+                    combo.blockSignals(False)
+                    break
+
+    def handle_panel_renamed(self, old_name, new_name):
+        """The panel-level counterpart to _handle_armature_renamed()
+        above - called (from RP_QuickPanel's own name update callback
+        in custom_actions_quick.py) when the CURRENTLY LOADED panel is
+        renamed in place from the Manage Panels list, so this
+        Controller's own live state follows the rename instead of
+        pointing at a name that no longer matches anything.
+
+        json_manager's on-disk migration and the Qt combo's displayed
+        text are handled by the caller/sync_panel_combo_items()
+        respectively - this only needs to move this rig's undo/redo
+        stack entries for the old panel name over to the new one, and
+        update self.panel_name itself so the next save()/_switch_to_panel()
+        comparison keys against the right name.
+        """
+        for stacks_dict in (self.undo_snapshots, self.redo_snapshots):
+            key = (self.armature_name, old_name)
+            if key in stacks_dict:
+                stacks_dict[(self.armature_name, new_name)] = stacks_dict.pop(key)
+
+        self.panel_name = new_name
+
+    def _sync_armature_combo_selection(self, combo):
+        """Keeps the Rig dropdown's *displayed selection* - not just its
+        item list - matching self.armature_name, so the three-way Rig
+        state (Blender viewport active object / this combo / the Quick
+        Actions N-panel's own Rig dropdown) never shows a rig here
+        while the N-panel shows none, or the other way around. Qt also
+        auto-selects the first item the moment a combo goes from empty
+        to non-empty on any clear()+addItem() rebuild, regardless of
+        which rig (if any) is actually loaded - this corrects that
+        too. Cheap no-op when already correct, so safe to call on
+        every poll tick regardless of whether anything else changed
+        this time.
+        """
+        target_text = self.armature_name or ""
+        if combo.currentText() == target_text:
+            return
+
+        combo.blockSignals(True)
+        try:
+            if target_text:
+                index = combo.findText(target_text)
+                combo.setCurrentIndex(index)
+            else:
+                combo.setCurrentIndex(-1)
+        finally:
+            combo.blockSignals(False)
+
+    def _purge_expired_armature_deletions(self, scene_armatures):
+        """Permanently removes saved data for rigs that have been gone
+        from the file for ARMATURE_DELETE_GRACE_SECONDS. A rig that came
+        back (undo, re-link, re-import) before its deadline is simply
+        dropped from the pending list and keeps everything."""
+        if not self._pending_armature_deletions:
+            return
+
+        now = time.monotonic()
+        for name, deadline in list(self._pending_armature_deletions.items()):
+            existing = bpy.data.objects.get(name)
+            if name in scene_armatures or (
+                existing is not None and existing.type == "ARMATURE"
+            ):
+                del self._pending_armature_deletions[name]
+                continue
+
+            if now < deadline:
+                continue
+
+            del self._pending_armature_deletions[name]
+            json_manager.delete_armature_data(name)
+
+            # A purged rig can never be switched back to, so every one of
+            # its (rig, panel) undo/redo stacks (and any pending image
+            # delete/backup riding along) has nowhere left to resolve.
+            for stacks_dict in (self.undo_snapshots, self.redo_snapshots):
+                for key in [k for k in stacks_dict if k[0] == name]:
+                    stale_stack = stacks_dict.pop(key)
+                    for stale_snapshot in stale_stack:
+                        self._settle_snapshot_pending_image(stale_snapshot, key)
+
+            # Quick multi-command buttons and Manage Panels rows are scoped
+            # to a rig by a plain name snapshot (armature_name); with the
+            # rig gone for good they'd sit in the Scene collections
+            # forever. Cleaned in EVERY scene - this branch is only
+            # reached once the rig is absent from bpy.data entirely.
+            from .. import custom_actions_quick
+            custom_actions_quick.purge_rig_quick_data(name)
+
+    def settle_before_file_change(self):
+        """Settle half of a file switch. Called from the lifecycle
+        dispatcher at load_pre (File > Open / New / Revert), while the
+        OUTGOING file's store is still the current one.
+
+        Pending undo-snapshot images (staged deletes/backups) and the
+        pending armature deletions all consult json_manager, which now
+        resolves to the file that is open - so they must be settled here,
+        before the switch, or they would be evaluated against the NEW
+        file's store. Armature deletions still in their grace period are
+        dropped without deleting anything (nothing says the removal was
+        saved; reopening the old file brings the rig back).
+        """
+        self._pending_armature_deletions.clear()
+
+        for stacks_dict in (self.undo_snapshots, self.redo_snapshots):
+            for key, stack in list(stacks_dict.items()):
+                for snapshot in stack:
+                    self._settle_snapshot_pending_image(snapshot, key)
+            stacks_dict.clear()
+
+    def repoint_paths(self, old_folder, new_folder):
+        """After a first save or Save As moved/copied the data folder:
+        re-points every absolute image path this controller holds (the
+        loaded layout, every undo/redo snapshot and their staged image
+        work) from old_folder to new_folder. Without it a later delete or
+        undo would act on the OLD file's images."""
+        tr = json_manager.translate_path
+
+        def fix_data(data):
+            if data and data.get("background"):
+                data["background"] = tr(data["background"], old_folder, new_folder)
+
+        def fix_stack(stack):
+            for snapshot in stack or ():
+                fix_data(snapshot.get("data"))
+                if snapshot.get("pending_image_delete"):
+                    snapshot["pending_image_delete"] = tr(
+                        snapshot["pending_image_delete"], old_folder, new_folder)
+                pending = snapshot.get("pending_image_backup")
+                if pending:
+                    snapshot["pending_image_backup"] = tuple(
+                        tr(p, old_folder, new_folder) for p in pending)
+
+        fix_data(self.data)
+        for stacks_dict in (self.undo_snapshots, self.redo_snapshots):
+            for stack in stacks_dict.values():
+                fix_stack(stack)
+
+        # History parked while a Clear All / panel removal can still be
+        # undone belongs to the same file, so it moves too - otherwise
+        # undoing that Clear All after a Save As would bring back snapshots
+        # that point into the old folder.
+        from .. import custom_actions_quick
+        parked = [entry.get("history") for entry in custom_actions_quick._PENDING_RIG_CLEARS]
+        parked += list(custom_actions_quick._PENDING_PANEL_HISTORY.values())
+        for history in parked:
+            for stacks in (history or {}).values():
+                if isinstance(stacks, dict):          # Clear All: {key: stack}
+                    for stack in stacks.values():
+                        fix_stack(stack)
+                else:                                 # panel removal: a stack
+                    fix_stack(stacks)
+
+    def on_file_loaded(self):
+        """UI-reset half of a file switch. Called from backend's
+        load_post handler (File > Open / New / Revert), after the store
+        has been swapped to the new file. Everything this controller
+        holds in memory belongs to the file that was just replaced. The
+        old file's rigs are simply not in the new file's scene, which is
+        not the same as deleted, so NOTHING is deleted from any store
+        here. Settling of pending items already happened at load_pre -
+        see settle_before_file_change()."""
+        self._pending_armature_deletions.clear()
+        self._known_armature_names_by_uid = {}
+
+        # Normally already empty (settled at load_pre). Cleared without
+        # settling on purpose: settling now would consult the NEW file's
+        # store.
+        self.undo_snapshots.clear()
+        self.redo_snapshots.clear()
+
+        self.armature_name = None
+        self.panel_name = None
+        self.data = json_manager.new_panel_data()
+        self.selected_bones = set()
+        self._pending_deselect_baseline = None
+        self.default_control_size = 18
+        self.default_control_shape = "CIRCLE"
+        self.default_control_color = "GREEN"
+
+        if self.window is not None:
+            combo = self.window.armature_combo
+            combo.blockSignals(True)
+            combo.clear()
+            combo.blockSignals(False)
+            self.refresh()
+            self.window.set_no_selection_defaults()
+
+    def _repaint_armature_combo(self, combo):
+        """Repaint just the Rig dropdown right now, after its items changed
+        from a bpy.app.timers callback (where Qt isn't pumped).
+
+        Deliberately NOT QApplication.processEvents(): that dispatches
+        EVERY queued Qt event - deferred deletes of the canvas controls
+        just rebuilt by load_armature(), enter/leave events, nested
+        processEvents() from PickerComboBox._apply_style(), etc. - from
+        inside Blender's timer, and a Python override raising during that
+        crashed Blender natively (shiboken6 access violation in
+        sendPostedEvents). A direct repaint() only paints this one widget.
+        """
+        try:
+            combo.update()
+            combo.repaint()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    def _fallback_if_current_rig_hidden(self, armature_objects):
+        """If the rig currently loaded in the picker has been hidden in the
+        viewport, switch the picker to the first visible rig (name-sorted -
+        the same choice the deleted-rig fallback in
+        _sync_armature_combo_items() makes), or to "no rig" if none is
+        visible.
+        Read-only with respect to Blender's own active object/selection -
+        only the picker's state moves (changing the active object from a
+        timer callback is unsafe). The hidden rig's data is saved first by
+        load_armature().
+        """
+        # load_armature() below calls back into _sync_armature_combo_items(),
+        # which would land here again - never nest, so a load that fails to
+        # move off the hidden rig can't recurse.
+        if getattr(self, "_hidden_fallback_active", False):
+            return False
+
+        name = self.armature_name
+        if not name:
+            return False
+        obj = armature_objects.get(name)
+        if obj is None or backend.is_rig_visible(obj):
+            return False
+
+        self._hidden_fallback_active = True
+        try:
+            return self._switch_off_hidden_rig(name, armature_objects)
+        finally:
+            self._hidden_fallback_active = False
+
+    def _switch_off_hidden_rig(self, name, armature_objects):
+
+        visible = sorted(
+            n for n, o in armature_objects.items() if backend.is_rig_visible(o)
+        )
+        if visible:
+            new_rig = armature_objects[visible[0]]
+            backend._CACHED_ARM = new_rig
+            backend._CACHED_ARM_NAME = new_rig.name
+            backend._QT_SYNCED_ARM_NAME = new_rig.name
+            self.load_armature(new_rig)
+        else:
+            if backend._CACHED_ARM_NAME == name:
+                backend._CACHED_ARM = None
+                backend._CACHED_ARM_NAME = None
+            backend._QT_SYNCED_ARM_NAME = None
+            self.load_armature(None)
+        return True
 
     def _sync_armature_combo_items(self):
         """Keeps the dropdown's list of choices in sync with the actual
@@ -1103,7 +1544,75 @@ class Controller:
             for obj in bpy.context.view_layer.objects
             if obj.type == "ARMATURE"
         }
+        # The combo's item list always contains EVERY armature in the view
+        # layer (same as before hiding was handled at all). Hidden rigs are
+        # only disabled here and skipped by PickerComboBox.showPopup(), so
+        # they never appear in the opened list - the items themselves are
+        # NOT removed/re-added on every hide/unhide, since that rebuild
+        # (clear()+addItem() on a styled combo) crashed Blender.
         scene_armatures = set(armature_objects)
+
+        # Detect armatures that are still the exact same underlying
+        # datablock as last time (session_uid is stable across a rename,
+        # unlike name) but now report a different name - i.e. renamed
+        # directly in Blender (Outliner double-click, F2, the Object/
+        # Armature Properties panel, etc.) rather than through this
+        # addon. Without this, a rename is indistinguishable below from
+        # "the old name was deleted and an unrelated new one was added",
+        # which either orphaned or (via the deleted-armature cleanup
+        # further down) outright deleted the rig's saved picker data
+        # just because Blender renamed the underlying object.
+        current_by_uid = {
+            obj.session_uid: name for name, obj in armature_objects.items()
+        }
+        prev_by_uid = self._known_armature_names_by_uid
+        renamed_pairs = [
+            (self._known_armature_names_by_uid[uid], new_name)
+            for uid, new_name in current_by_uid.items()
+            if uid in self._known_armature_names_by_uid
+            and self._known_armature_names_by_uid[uid] != new_name
+        ]
+        self._known_armature_names_by_uid = current_by_uid
+
+        if renamed_pairs:
+            from .. import custom_actions_quick
+            # Data first (layouts, scene buttons/panels, session memory),
+            # for the whole batch at once so a swap is handled safely.
+            custom_actions_quick.migrate_rig_renames(
+                [
+                    (old_name, new_name, uid)
+                    for uid, new_name in current_by_uid.items()
+                    for old_name in [prev_by_uid.get(uid)]
+                    if old_name is not None and old_name != new_name
+                ]
+            )
+
+            if custom_actions_quick.rig_renames_conflict(renamed_pairs):
+                # Swapped/cycled names: take each rig through a unique
+                # temporary name so this Controller's own per-name state
+                # (undo stacks, combo entries, armature_name) never has two
+                # rigs sharing a name mid-way.
+                import uuid
+                staged = []
+                for old_name, new_name in renamed_pairs:
+                    temp = f"__rig_rename_{uuid.uuid4().hex}__"
+                    self._handle_armature_renamed(old_name, temp)
+                    staged.append((temp, new_name))
+                for temp, new_name in staged:
+                    self._handle_armature_renamed(temp, new_name)
+            else:
+                for old_name, new_name in renamed_pairs:
+                    self._handle_armature_renamed(old_name, new_name)
+
+        if renamed_pairs:
+            # _handle_armature_renamed() updates the combo entry's text
+            # in place - refresh current_items so the rest of this
+            # method (and the deleted-armature diff below in particular)
+            # sees the rig under its new name instead of treating the
+            # name it no longer has as a removal.
+            current_items = {combo.itemText(i) for i in range(combo.count())}
+
+        self._purge_expired_armature_deletions(scene_armatures)
 
         if current_items == scene_armatures:
             # Nothing added/removed/renamed, but a rig's hide state may
@@ -1112,39 +1621,42 @@ class Controller:
             # disabled state of each entry in sync regardless of whether
             # a full rebuild happens this call.
             self._sync_armature_combo_enabled_state(combo, armature_objects)
+            self._fallback_if_current_rig_hidden(armature_objects)
+
+            # Also reconcile the *displayed selection* every tick, not
+            # just on a full item-list rebuild - the scene's set of
+            # armatures doesn't change just because the active object
+            # switched from one of them to something else entirely (a
+            # camera, say), but self.armature_name does, and this combo
+            # needs to follow it every time either way. See
+            # _sync_armature_combo_selection()'s own comment for the
+            # three-way desync this fixes.
+            self._sync_armature_combo_selection(combo)
+
+            # See the matching comment near the end of this method - this
+            # call also runs from a bpy.app.timers callback, so any Qt
+            # follow-up to the enabled-state change above needs an
+            # explicit flush rather than waiting on a real input event.
+            self._repaint_armature_combo(combo)
             return
 
         # Any name that was selectable a moment ago but is no longer an
-        # armature in the scene was deleted - not just renamed (a rename
-        # would still show up as a "new" name in scene_armatures, so it
-        # isn't caught here, only genuine removals are). The picker's own
-        # data lives entirely in rig_picker_data.json, keyed by armature
-        # name, and nothing else ever prunes that file - the dropdown
-        # simply "forgetting" the name left its JSON entry (controls,
-        # background image path, everything) as permanent orphaned data
-        # with no UI path to reach or clear it. Delete it here, at the
-        # same point the deletion is actually detected, the same way
-        # clear_all() would for the currently-loaded armature.
+        # armature in this view layer. That is NOT the same as deleted:
+        # the rig can also be excluded via its collection, live in another
+        # scene/view layer, or belong to the file that was just replaced.
+        # Only a rig that no longer exists as an armature object anywhere
+        # in bpy.data is a candidate for having its saved data purged, and
+        # even then only after ARMATURE_DELETE_GRACE_SECONDS (see
+        # _purge_expired_armature_deletions()) so Ctrl+Z can bring it back
+        # with its layout intact. Everything else just becomes
+        # unselectable here while its saved data stays untouched.
         deleted_armatures = current_items - scene_armatures
         for name in deleted_armatures:
-            json_manager.delete_armature_data(name)
-            # A deleted rig can never be switched back to, so its undo
-            # AND redo history (and any pending image delete/backup
-            # riding along with each of their snapshots) has nowhere
-            # left to ever be resolved - discard both stacks outright
-            # rather than leaving them in the dicts forever. Only undo
-            # was being popped here before - the redo stack for a
-            # deleted rig (e.g. one that still had an un-redone undo
-            # sitting on it) was left behind permanently instead.
-            stale_stack = self.undo_snapshots.pop(name, None)
-            if stale_stack:
-                for stale_snapshot in stale_stack:
-                    self._settle_snapshot_pending_image(stale_snapshot, name)
-
-            stale_redo_stack = self.redo_snapshots.pop(name, None)
-            if stale_redo_stack:
-                for stale_redo_entry in stale_redo_stack:
-                    self._settle_snapshot_pending_image(stale_redo_entry, name)
+            existing = bpy.data.objects.get(name)
+            if existing is None or existing.type != "ARMATURE":
+                self._pending_armature_deletions.setdefault(
+                    name, time.monotonic() + ARMATURE_DELETE_GRACE_SECONDS
+                )
 
         combo.blockSignals(True)
         combo.clear()
@@ -1153,21 +1665,23 @@ class Controller:
         combo.blockSignals(False)
 
         self._sync_armature_combo_enabled_state(combo, armature_objects)
+        self._fallback_if_current_rig_hidden(armature_objects)
 
         # The armature currently loaded into the picker can itself be
         # one of the deleted ones (e.g. the user deletes the rig that's
         # actively showing in the picker, and nothing else becomes the
-        # active object afterwards). Its data was just wiped from JSON
-        # above, but self.armature_name/self.data still reference it in
-        # memory - left alone, the next self.save() (fired by all sorts
-        # of routine picker actions) would simply write self.data back
-        # out under that name, silently undoing the delete. Clear the
-        # in-memory state directly instead of going through
+        # active object afterwards) or simply left the view layer. Its
+        # saved data is NOT deleted here (see the grace-period purge
+        # above), but self.armature_name/self.data still reference a rig
+        # the picker can no longer act on - drop the in-memory state
+        # rather than keep editing/saving against a rig that isn't
+        # selectable. Clear it directly instead of going through
         # load_armature(None), which would call self.save() FIRST and
         # resurrect the very entry this method just removed.
         if self.armature_name in deleted_armatures:
             self.armature_name = None
-            self.data = json_manager.new_armature_data()
+            self.panel_name = None
+            self.data = json_manager.new_panel_data()
             self.selected_bones = set()
             # This rig's entire undo stack (and any pending image
             # delete/backup riding along with each of its snapshots) was
@@ -1183,9 +1697,62 @@ class Controller:
             self.default_control_size = 18
             self.default_control_shape = "CIRCLE"
             self.default_control_color = "GREEN"
-            self.refresh()
 
-            self.window.set_no_selection_defaults()
+            # Don't leave the picker sitting on an empty selection just
+            # because the rig that happened to be loaded was the one
+            # deleted - if any armatures are still left in the scene,
+            # fall onto the first one in the (now-rebuilt, sorted)
+            # dropdown, the same as if the user had picked it themselves.
+            # self.armature_name is already None at this point, so
+            # load_armature()'s save() call can't resurrect the deleted
+            # rig's JSON entry.
+            #
+            # Deliberately call load_armature() directly here rather than
+            # change_armature() - change_armature() also reassigns
+            # view_layer.objects.active, touches object selection, and
+            # can run bpy.ops.object.mode_set() through a context
+            # override. This method runs from backend.poll_active_armature
+            # (a bpy.app.timers callback), and poll_active_armature's own
+            # existing armature-switch handling already calls
+            # load_armature() directly from that same context for exactly
+            # this reason - mutating scene selection/mode from here (as
+            # opposed to just the Qt-side picker state) was what left Qt
+            # without a real UI event to process afterwards, so nothing
+            # visibly updated until an actual input event (e.g. the mouse
+            # moving over the window) pumped the event loop.
+            remaining = sorted(scene_armatures)
+            if remaining:
+                new_rig = armature_objects[remaining[0]]
+
+                # refresh() (called by load_armature() below) syncs bone
+                # visibility through backend.arm(), which returns
+                # whatever armature is currently *cached* - not
+                # necessarily this newly-picked one, since deliberately
+                # not touching view_layer.objects.active above means
+                # Blender's own active object may still be the deleted
+                # rig (now stale) or nothing at all. Point the cache at
+                # the rig we're actually loading so that sync lands on
+                # the right object instead of a freed one or none.
+                backend._CACHED_ARM = new_rig
+                backend._CACHED_ARM_NAME = new_rig.name
+                # Already loaded into the picker right here - stops the
+                # next poll tick from reloading this same rig a second
+                # time (see backend._QT_SYNCED_ARM_NAME).
+                backend._QT_SYNCED_ARM_NAME = new_rig.name
+
+                self.load_armature(new_rig)
+            else:
+                # No armatures left in the scene at all - the cached
+                # active-armature reference (if it still points at the
+                # one just deleted) is now stale. Clear it rather than
+                # leaving a freed object behind for the next arm() call
+                # to trip over.
+                if backend._CACHED_ARM_NAME in deleted_armatures:
+                    backend._CACHED_ARM = None
+                    backend._CACHED_ARM_NAME = None
+
+                self.refresh()
+                self.window.set_no_selection_defaults()
 
         # Qt auto-selects the first item the moment a combo goes from
         # empty to non-empty, which happens on every clear()+addItem()
@@ -1194,33 +1761,49 @@ class Controller:
         # loaded in the picker (some other, unrelated rig was removed),
         # the dropdown could end up visibly showing the wrong name while
         # self.armature_name still correctly points at the real one.
-        # Re-apply the displayed selection from self.armature_name every
-        # time the list is rebuilt, the same way load_armature() does.
-        combo.blockSignals(True)
-        target_text = self.armature_name or ""
-        if target_text:
-            index = combo.findText(target_text)
-            combo.setCurrentIndex(index)
-        else:
-            combo.setCurrentIndex(-1)
-        combo.blockSignals(False)
+        self._sync_armature_combo_selection(combo)
+
+        # This whole rebuild ran from a bpy.app.timers callback, not a
+        # real Qt-driven tick - on Windows, bqt shares Blender's native
+        # message queue instead of running its own event loop, so
+        # anything Qt needs to do as a follow-up to the mutations above
+        # (repainting, delivering the internal itemChanged signal each
+        # addItem()/setEnabled() emits on the combo's model, etc.) was
+        # simply left queued until the next real OS input message (e.g.
+        # a mouse move over the window) happened to pump it - which is
+        # why the picker visibly looked unchanged right after a rig was
+        # deleted until the mouse was moved over the UI. Flush explicitly
+        # here instead of waiting for that to happen by chance.
+        self._repaint_armature_combo(combo)
 
     def load_armature(self, rig):
-        """Saves the current picker to JSON, then loads the given armature's
-        picker (or a blank one) from JSON and refreshes the UI."""
+        """Saves the current picker to JSON, then switches to the given
+        armature (or none) and refreshes the UI.
+
+        This only switches which RIG is active - self.armature_name and
+        rig-level state (Quick Action buttons, the Rig dropdown). Which
+        PANEL of that rig is loaded (self.panel_name/self.data) is left
+        unresolved here (reset to a blank placeholder) and picked up a
+        few lines later in the same poll tick by
+        _ensure_default_panel_for_rig()/sync_panel_combo_items() calling
+        _switch_to_panel() - at the point THIS method runs, the new
+        rig's active panel isn't known yet (it may not even exist yet,
+        for a rig that's never had one), so there's nothing real to load
+        for it here.
+        """
 
         # Persist whatever is currently loaded before switching away from it.
         self.save()
 
         self.selected_bones = set()
 
-        # Nothing to do here for undo anymore - each rig's stack lives
-        # in self.undo_snapshots[rig_name], including any pending
-        # background-image delete/backup each of its snapshots is
-        # carrying (see _record_undo_snapshot(), _stage_image_backup()),
-        # so it's already exactly where it needs to be regardless of
-        # which rig is currently loaded. Switching rigs doesn't touch
-        # any of it.
+        # Nothing to do here for undo anymore - each (rig, panel) pair's
+        # stack lives in self.undo_snapshots[self._snapshot_key(...)],
+        # including any pending background-image delete/backup each of
+        # its snapshots is carrying (see _record_undo_snapshot(),
+        # _stage_image_backup()), so it's already exactly where it needs
+        # to be regardless of which rig is currently loaded. Switching
+        # rigs doesn't touch any of it.
 
         # A pending deselect-baseline (see deselect_all()) holds bone
         # names from whatever armature was loaded a moment ago. Left in
@@ -1243,13 +1826,31 @@ class Controller:
         self.default_control_shape = "CIRCLE"
         self.default_control_color = "GREEN"
 
-        if rig is None:
-            self.armature_name = None
-            self.data = json_manager.new_armature_data()
-        else:
-            self.armature_name = rig.name
-            stored = json_manager.get_armature_data(rig.name)
-            self.data = stored if stored is not None else json_manager.new_armature_data()
+        self.armature_name = None if rig is None else rig.name
+        # Panel not resolved yet - see docstring. A blank placeholder
+        # here is the correct thing to show for the brief moment before
+        # _ensure_default_panel_for_rig()/sync_panel_combo_items()
+        # resolve and load the real one later this same tick.
+        self.panel_name = None
+        self.data = json_manager.new_panel_data()
+
+        # Rebuild Quick Action buttons for the NEW rig before refresh()
+        # below - refresh() restores overlay_positions/calls
+        # update_overlay_buttons() against whatever's currently
+        # registered in canvas.OVERLAY_DRAG_GROUPS, and the buttons may
+        # have changed (added/removed/renamed) since this rig was last
+        # loaded (see PickerCanvas.sync_quick_actions()). Doing this
+        # AFTER refresh() instead (as change_armature() used to) meant
+        # refresh() painted once with the PREVIOUS rig's leftover
+        # buttons still registered, then this call tore them down and
+        # rebuilt the correct set a moment later - visible as one
+        # button appearing, then the rest popping in a beat after.
+        # Syncing first means refresh() only ever paints the final,
+        # correct set - a single pass. self.armature_name was already
+        # updated to the NEW rig earlier in this method, so this
+        # correctly filters the Quick multi-command group to it.
+        if self.window is not None:
+            self.window.sync_quick_actions()
 
         self.refresh()
 
@@ -1260,17 +1861,30 @@ class Controller:
 
             # Keep the dropdown's displayed text in sync when the active
             # armature changes from outside the combo itself (e.g. clicking
-            # a different rig in the 3D viewport, detected by
-            # backend.poll_active_armature). Block signals while setting it
-            # so this doesn't re-trigger change_armature() and recurse back
-            # into load_armature().
+            # a different rig - or something that isn't a rig at all - in
+            # the 3D viewport, detected by backend.poll_active_armature).
+            # Block signals while setting it so this doesn't re-trigger
+            # change_armature() and recurse back into load_armature().
+            #
+            # target_text is "" whenever self.armature_name is None (no
+            # rig active) - findText("") never matches a real item, so it
+            # returns -1 exactly like "no selection" already does. That
+            # used to be treated as "nothing to set", skipping
+            # setCurrentIndex() entirely and leaving the combo still
+            # showing whatever rig was selected before - which is why
+            # selecting something other than a rig in the viewport looked
+            # like it had no effect on the picker at all. -1 IS the
+            # correct index for "no selection" (it's what shows the
+            # "Select Rig" placeholder - see PickerComboBox.
+            # setPlaceholderText() in main_window.py), so it has to be
+            # passed through to setCurrentIndex() too, not just a
+            # genuine match.
             combo = self.window.armature_combo
             target_text = self.armature_name or ""
             if combo.currentText() != target_text:
                 combo.blockSignals(True)
-                index = combo.findText(target_text)
-                if index >= 0:
-                    combo.setCurrentIndex(index)
+                index = combo.findText(target_text) if target_text else -1
+                combo.setCurrentIndex(index)
                 combo.blockSignals(False)
 
     def change_armature(self, armature_name):
@@ -1286,12 +1900,24 @@ class Controller:
         # that already runs on the poll timer catch up and drop this
         # stale entry from the dropdown.
         view_layer = bpy.context.view_layer
-        if armature_name not in view_layer.objects:
+        if armature_name not in view_layer.objects or not backend.is_rig_visible(rig):
+            # Not in this view layer, or hidden - neither can be made
+            # active. Re-sync so the dropdown drops the stale entry.
             self._sync_armature_combo_items()
             return
 
         backend._CACHED_ARM = rig
         backend._CACHED_ARM_NAME = rig.name
+        # Also mark this rig as already synced to the Qt UI (see
+        # backend._QT_SYNCED_ARM_NAME's own comment) - self.load_armature()
+        # a few lines down already does the actual sync, right now, from
+        # this same call. Without this, poll_active_armature()'s next
+        # tick would see this rig's name still didn't match
+        # _QT_SYNCED_ARM_NAME, treat that as "the Qt UI hasn't heard about
+        # this rig yet", and reload it a second time right behind this
+        # one - redundant, and a visible flicker (canvas repaint, combo
+        # reselect, etc.) for no reason.
+        backend._QT_SYNCED_ARM_NAME = rig.name
 
         for obj in view_layer.objects:
             if obj != rig and obj.select_get():
@@ -1320,10 +1946,199 @@ class Controller:
                 with bpy.context.temp_override(**override):
                     bpy.ops.object.mode_set(mode='OBJECT')
 
+    def change_panel(self, panel_name):
+        """Keeps the Qt picker's own Panel dropdown (stale_combo) and the
+        Manage Panels N-panel section's selected row
+        (Scene.rp_quick_action_settings.panels/panels_index) in
+        two-way sync - the same guarded-flag pattern change_armature()'s
+        counterpart (_on_quick_active_rig_changed() in
+        custom_actions_quick.py) uses for the Rig dropdown. Called both
+        when the user picks a different item in the Qt combo itself
+        (wired up in main_window.py) and, via panels_index's own update
+        callback, when the user selects a different row in the N-panel
+        list instead - either direction pushes the new selection into
+        the other side. The Qt combo's actual item list (add/rename/
+        remove made from the N-panel) is kept current separately by
+        sync_panel_combo_items(), called every poll tick.
+        """
+        from .. import custom_actions_quick
+
+        # Load this panel's own data (and save whatever was loaded
+        # before it) right away, rather than waiting for the next poll
+        # tick's sync_panel_combo_items() to notice - this is the direct,
+        # user-driven pick (Qt combo or N-panel list), so it should feel
+        # instant. No-ops if this panel is already the one loaded (e.g.
+        # called from the settings.panels_index branch below when
+        # THIS call is itself what triggered that index change).
+        self._switch_to_panel(panel_name)
+
+        if self.window is not None and self.window.stale_combo.currentText() != panel_name:
+            self.window.stale_combo.blockSignals(True)
+            try:
+                self.window.stale_combo.setCurrentText(panel_name)
+            finally:
+                self.window.stale_combo.blockSignals(False)
+
+        scene = bpy.context.scene
+        settings = getattr(scene, "rp_quick_action_settings", None) if scene else None
+        if settings is None:
+            return
+
+        # Panels are rig-independent (each rig keeps its own set - Face,
+        # Body, etc.), so different rigs can easily have same-named
+        # panels ("Panel 1" on both). Matching by name alone here could
+        # jump to a completely different rig's panel that just happens
+        # to share this one's name - scope the lookup to panels
+        # belonging to whichever rig is actually loaded right now.
+        current_rig_name = self.armature_name or ""
+        index = next(
+            (
+                i for i, p in enumerate(settings.panels)
+                if p.armature_name == current_rig_name and p.name == panel_name
+            ),
+            -1,
+        )
+        if index == -1 or settings.panels_index == index:
+            return
+
+        custom_actions_quick._SYNCING_QUICK_PANEL_DROPDOWN = True
+        try:
+            settings.panels_index = index
+        finally:
+            custom_actions_quick._SYNCING_QUICK_PANEL_DROPDOWN = False
+
+    def sync_panel_combo_items(self):
+        """Keeps the Qt picker's own Panel dropdown (stale_combo) in step
+        with whichever rig is currently loaded's own panels -
+        Scene.rp_quick_action_settings.panels filtered to
+        armature_name == self.armature_name, the Manage Panels
+        N-panel section's add/rename/remove list for THIS rig
+        specifically (each rig keeps its own independent set, the same
+        way Section 1's multi-command buttons are scoped per rig) - the
+        same way _sync_armature_combo_items() keeps the Rig dropdown in
+        step with the scene's actual armatures. Called every poll tick
+        (see backend.poll_active_armature()), so an add/rename/remove,
+        or switching to a different rig entirely, shows up here without
+        needing the window to be reopened.
+        """
+        if self.window is None:
+            return
+
+        scene = bpy.context.scene
+        settings = getattr(scene, "rp_quick_action_settings", None) if scene else None
+        if settings is None:
+            return
+
+        current_rig_name = self.armature_name or ""
+        combo = self.window.stale_combo
+
+        # No rig loaded -> nothing to pick a panel for (panels are
+        # scoped per rig). Disable the combo and show "Select" rather
+        # than "No Panel", which would wrongly imply a rig is loaded
+        # and just happens to have no panels of its own. Cheap no-op
+        # once already correct, so safe every poll tick.
+        should_be_enabled = bool(current_rig_name)
+        if combo.isEnabled() != should_be_enabled:
+            combo.setEnabled(should_be_enabled)
+            combo.setPlaceholderText("No Panel" if should_be_enabled else "Select")
+
+        names = [p.name for p in settings.panels if p.armature_name == current_rig_name]
+        current_items = [combo.itemText(i) for i in range(combo.count())]
+
+        if current_items != names:
+            combo.blockSignals(True)
+            try:
+                combo.clear()
+                combo.addItems(names)
+            finally:
+                combo.blockSignals(False)
+
+        resolved_panel_name = None
+        if 0 <= settings.panels_index < len(settings.panels):
+            selected_panel = settings.panels[settings.panels_index]
+            if selected_panel.armature_name == current_rig_name:
+                resolved_panel_name = selected_panel.name
+
+        # Load/save this (rig, panel) pair's own data - the safety net
+        # for switches that don't go through change_panel() directly:
+        # a rig switch landing on a different panel (load_armature()
+        # itself runs before the new rig's active panel is even known),
+        # or _ensure_default_panel_for_rig() having just created a rig's
+        # very first panel this same tick, right before this method
+        # runs. No-ops if this pair is already what's loaded.
+        self._switch_to_panel(resolved_panel_name)
+
+        # Safety net for the Quick multi-command buttons: re-filter the
+        # canvas whenever the loaded (rig, panel) pair differs from the
+        # one it was last filtered for (covers switches that set
+        # self.panel_name directly, or that skipped _switch_to_panel()'s
+        # own sync because the name already matched).
+        # LIMIT: this compares only the (rig, panel) NAMES, and runs once
+        # per poll tick. It re-filters which buttons are shown; it doesn't
+        # detect a button's own fields (label, toggle state) changing -
+        # those are refreshed by the operators and the frame-change
+        # handler that change them.
+        quick_key = (self.armature_name, self.panel_name)
+        if quick_key != self._quick_synced_key:
+            self._quick_synced_key = quick_key
+            self.window.sync_quick_actions()
+            # Rig / Panel labels + button list in the N-panel are drawn
+            # from scene data; a change made from the Qt picker or the
+            # viewport doesn't redraw that region by itself.
+            self._redraw_all_areas()
+
+        if resolved_panel_name is not None and combo.currentText() != resolved_panel_name:
+            combo.blockSignals(True)
+            try:
+                combo.setCurrentText(resolved_panel_name)
+            finally:
+                combo.blockSignals(False)
+        elif resolved_panel_name is None and combo.currentIndex() != -1:
+            # panels_index is still pointing at a different rig's
+            # panel (e.g. this tick's _ensure_default_panel_for_rig()
+            # hasn't run yet, or no rig is active at all right now) -
+            # nothing of this rig's own to show as selected.
+            combo.blockSignals(True)
+            try:
+                combo.setCurrentIndex(-1)
+            finally:
+                combo.blockSignals(False)
+
+    def _load_panel_defaults(self):
+        """Sets the "what a new control looks like" defaults from the loaded
+        panel's own saved values (stock 18 / Circle / Green if it has none).
+        """
+        saved = self.data.get("defaults") if isinstance(self.data, dict) else None
+        if not isinstance(saved, dict):
+            saved = {}
+        size = saved.get("size")
+        self.default_control_size = size if isinstance(size, int) and not isinstance(size, bool) else 18
+        self.default_control_shape = saved.get("shape") if isinstance(saved.get("shape"), str) else "CIRCLE"
+        self.default_control_color = saved.get("color") if isinstance(saved.get("color"), str) else "GREEN"
+
+    def _save_panel_defaults(self):
+        """Stores the current new-control defaults with the loaded panel
+        and writes them to disk right away (auto-save)."""
+        if not (self.armature_name and self.panel_name):
+            return
+        wanted = {
+            "size": self.default_control_size,
+            "shape": self.default_control_shape,
+            "color": self.default_control_color,
+        }
+        stock = {"size": 18, "shape": "CIRCLE", "color": "GREEN"}
+        if self.data.get("defaults") == wanted or (
+            "defaults" not in self.data and wanted == stock
+        ):
+            return
+        self.data["defaults"] = wanted
+        self.save()
+
     def save(self):
-        """Writes the current in-memory data to rig_picker_data.json."""
-        if self.armature_name:
-            json_manager.save_armature_data(self.armature_name, self.data)
+        """Writes the current in-memory data to rig_picker_data.json,
+        under the currently loaded (rig, panel) pair."""
+        if self.armature_name and self.panel_name:
+            json_manager.save_panel_data(self.armature_name, self.panel_name, self.data)
 
     def find_item(self, bone_name):
         return next(
@@ -1331,90 +2146,205 @@ class Controller:
             None,
         )
 
-    def _resolve_ikfk_group(self):
-        """Resolves the single IK/FK group that ALL of self.selected_bones
-        belong to.
+    def refresh_custom_action_enabled_states(self):
+        """Grays out a Quick Action's picker-canvas button (or, for a
+        Toggle, its switch + flanking name label) whenever the current
+        selection wouldn't match any of that action's rules - i.e.
+        clicking it right now would just no-op with a
+        self.report({'WARNING'}, ...) that's easy to miss, and outright
+        invisible from this floating window.
 
-        Shift-selecting several controls that are all part of the same
-        limb (e.g. upper_arm_fk.L + forearm_fk.L, both under the
-        "upper_arm_parent.L" group) should still be treated as one valid
-        selection for IK/FK purposes - the old code only ever looked at
-        the selection when it contained exactly one bone, so snapping
-        silently did nothing the moment a second control was shift-added.
+        Uses self.selected_bones (this controller's own tracked
+        selection) rather than re-querying bpy.context directly, so
+        every overlay control stays in agreement about what's currently
+        selected.
 
-        Returns (parent_bone_name, group_dict) if every selected bone
-        resolves to the same group, otherwise (None, None) - e.g. when
-        nothing is selected, a selected bone isn't part of any IK/FK
-        group, or the selection spans two different groups (which has no
-        single well-defined snap target).
-        """
-        if not self.selected_bones:
-            return None, None
-
-        resolved_parents = set()
-
-        for bone in self.selected_bones:
-            match = None
-
-            for parent, group in IK_FK_GROUPS.items():
-                if (
-                    bone == parent
-                    or bone in group["output_bones"]
-                    or bone in group["input_bones"]
-                    or bone in group["ctrl_bones"]
-                ):
-                    match = parent
-                    break
-
-            if match is None:
-                return None, None
-
-            resolved_parents.add(match)
-
-        if len(resolved_parents) != 1:
-            return None, None
-
-        parent = next(iter(resolved_parents))
-        return parent, IK_FK_GROUPS[parent]
-
-    def refresh_ikfk_label(self):
-        """Updates the IK/FK toggle button to show the state it will
-        switch TO if clicked (e.g. "->IK" while currently in FK), based
-        on the currently selected control(s)' live IK_FK property. Shows a
-        neutral label when the current selection doesn't resolve to a
-        single IK/FK group.
+        Called from here (every place self.selected_bones changes) and
+        again from PickerCanvas.sync_quick_actions() itself, so a
+        freshly added/rebuilt button starts in the correct state too,
+        instead of defaulting to enabled until the next selection
+        change.
         """
         if self.window is None:
             return
 
-        is_fk = None
+        # Snap each Quick Toggle's on/off position to whatever its
+        # now-relevant rule's bone/property actually holds, not just its
+        # enabled/disabled look - selecting a different control (e.g.
+        # switching from a Left to a Right bone under the same action)
+        # can change which rule applies, and therefore which bone's value
+        # the toggle should be showing, same as changing frames does.
+        # Passing self.selected_bones explicitly (rather than letting it
+        # fall back to bpy.context.selected_pose_bones) matters here:
+        # this runs as part of handling the selection change itself, so
+        # the live viewport selection can still be a step behind this
+        # controller's own already-updated selected_bones at this exact
+        # point - reading bpy.context here risked matching against the
+        # selection this change is replacing, not the new one.
+        from .. import custom_actions_quick
+        custom_actions_quick.sync_quick_toggle_states(bpy.context.scene, self.selected_bones)
 
-        parent_bone, group = self._resolve_ikfk_group()
+        # Quick single-command buttons - always enabled (selection plays
+        # no part), re-asserted here so none can ever be left disabled.
+        self.refresh_quick_single_action_enabled_states()
 
-        if parent_bone is not None:
-            rig = backend.arm()
+        # Same for the Quick multi-command buttons.
+        self.refresh_quick_multi_action_enabled_states()
 
-            if rig is not None:
-                pb = rig.pose.bones.get(parent_bone)
+    def refresh_quick_single_action_enabled_states(self):
+        """Keeps every Quick single-command button in
+        custom_actions_quick.py enabled. They never grey out for
+        selection reasons (not with nothing selected, not for any other
+        reason - the multi-command buttons are the ones that depend on the
+        selection, see refresh_quick_multi_action_enabled_states() below).
+        The one exception is a MALFORMED button - 2+ commands on something
+        that must hold exactly one (see
+        custom_actions_quick.single_action_rule()) - which can't run, so it
+        is greyed out with a tooltip saying why, rather than looking
+        clickable and then refusing.
 
-                if pb is not None and "IK_FK" in pb:
-                    # Rigify convention: 0.0 = IK, 1.0 = FK
-                    is_fk = float(pb["IK_FK"]) >= 0.5
+        Still called from refresh_custom_action_enabled_states() above
+        and from PickerCanvas.sync_quick_actions(), so a button that was
+        just created or rebuilt is explicitly set enabled too.
+        """
+        if self.window is None:
+            return
 
-        self.window.control_list.container.update_ikfk_toggle(is_fk)
+        settings = getattr(bpy.context.scene, "rp_quick_action_settings", None)
+        actions = settings.single_actions if settings is not None else []
 
-    # ---------------------------------------------------------
+        from .. import custom_actions_quick
+
+        problems_by_uid = {}
+        for action in actions:
+            problem = custom_actions_quick.single_action_problem(action)
+            if problem:
+                problems_by_uid[action.uid] = problem
+        enabled_by_uid = {
+            action.uid: action.uid not in problems_by_uid for action in actions
+        }
+
+        self.window.control_list.container.update_quick_single_actions_enabled(
+            enabled_by_uid, problems_by_uid
+        )
+
+    def refresh_quick_multi_action_enabled_states(self):
+        """Prototype counterpart to refresh_custom_action_enabled_states()
+        above, for the Quick multi-command buttons in
+        custom_actions_quick.py - grays out a button's canvas widget
+        whenever the current selection doesn't match any of that
+        button's rules, using custom_actions_quick._quick_find_matching_rule()
+        (the exact same check the N-panel's draw_multi_action() and
+        RP_OT_quick_run_multi_action itself use), so "looks clickable"
+        and "is clickable" can't drift apart on the picker canvas
+        either.
+
+        Only actions scoped to this controller's own (rig, panel) pair
+        are considered - the canvas only ever shows those anyway (see
+        PickerCanvas.sync_quick_actions()).
+
+        Called from refresh_custom_action_enabled_states() above (so
+        every place that already refreshes the real buttons' enabled
+        state refreshes these too) and again from PickerCanvas.
+        sync_quick_actions() itself, so a freshly added/rebuilt or
+        just-switched-back-into-view button starts in the correct
+        state too.
+        """
+        if self.window is None:
+            return
+
+        from .. import custom_actions_quick
+
+        settings = getattr(bpy.context.scene, "rp_quick_action_settings", None)
+        actions = [
+            action for action in (settings.multi_actions if settings is not None else [])
+            if custom_actions_quick._quick_multi_action_visible(
+                settings, action, self.armature_name, self.panel_name
+            )
+        ]
+
+        enabled_by_uid = {
+            action.uid: custom_actions_quick._quick_find_matching_rule(
+                self.selected_bones, action.rules
+            )[0] is not None
+            for action in actions
+        }
+
+        # Validate every button's Control shape bones against the live rig,
+        # so a button that can't enable because a rule's bone was renamed/
+        # deleted says why (tooltip + warning look on the canvas) instead of
+        # just sitting there disabled. Skipped (nothing flagged) unless the
+        # cached rig really is the one this controller has loaded.
+        rig = backend.arm()
+        if rig is None or rig.type != "ARMATURE" or rig.name != self.armature_name:
+            rig = None
+        problems_by_uid = {}
+        for action in actions:
+            missing = custom_actions_quick.quick_action_missing_bones(action, rig)
+            if missing:
+                problems_by_uid[action.uid] = (
+                    "Control bones missing on the rig (renamed or deleted?):\n"
+                    + custom_actions_quick.quick_missing_bones_text(missing)
+                )
+
+        self.window.control_list.container.update_quick_multi_actions_enabled(
+            enabled_by_uid, problems_by_uid
+        )
+
+    def refresh_quick_multi_action_bone_validity(self):
+        """Re-validates the Quick multi-command buttons' Control shape bones
+        when the active rig's bone NAMES change - a rename, a delete, an undo
+        that brings a bone back, a script adding one. None of those fire a
+        signal this addon sees, so this runs every poll tick (see
+        backend.poll_active_armature()) but is a no-op unless the set of
+        names actually differs from the last pass (one set comparison).
+
+        A rig switch is already covered: load_armature() -> refresh() ends in
+        refresh_quick_multi_action_enabled_states(), which validates against
+        whichever rig is loaded. This only adds the "same rig, its bones
+        changed underneath us" case, and re-validates the N-panel too (which
+        validates live on every redraw, but needs one to be requested).
+        """
+        rig = backend.arm()
+        if rig is None or rig.type != "ARMATURE" or rig.name != self.armature_name:
+            fingerprint = None
+        else:
+            fingerprint = (rig.name, rig.session_uid, frozenset(rig.pose.bones.keys()))
+
+        if fingerprint == self._quick_bone_fingerprint:
+            return
+        previous = self._quick_bone_fingerprint
+        self._quick_bone_fingerprint = fingerprint
+        if previous is None or fingerprint is None:
+            # First look at a rig (or none at all): load/refresh already
+            # validated it; nothing changed underneath us.
+            return
+
+        self.refresh_quick_multi_action_enabled_states()
+        self._redraw_all_areas()
 
     def _update_action_controls_enabled(self):
-        """Add Selected / Clear All / Delete, and the Symmetry / IK-FK /
-        Motion Paths checkboxes, all operate on controls placed relative
+        """Add Selected / Clear All / Delete, and the Symmetry
+        checkbox, all operate on controls placed relative
         to a background image - so keep them disabled until this rig
         actually has one, rather than letting someone add/delete
         controls or enable symmetry against a canvas with nothing to
-        position against. Capture View itself is deliberately left
-        alone: it's what produces the background in the first place, so
-        gating it the same way would make it impossible to ever get
-        past this state.
+        position against. Capture View is gated on a coarser condition
+        (having a rig loaded AT ALL, regardless of whether it has a
+        background yet) rather than has_background itself: it's what
+        produces the background in the first place, so gating it the
+        same way would make it impossible to ever get past that state
+        for a rig that's actually loaded - but with no rig loaded at
+        all (nothing armature-shaped active in the viewport, or an
+        object of some other type selected instead) there's no rig for
+        it to capture a background FOR, so it stays disabled along
+        with everything else until a rig is picked.
+
+        The picker canvas itself (self.window.control_list) is gated
+        the same coarse way, purely so the whole panel visibly reads
+        as "off" the moment no rig is active - not because there's
+        anything left to interact with there anyway, since refresh()
+        already empties it in that state.
 
         Delete additionally requires a non-empty self.selected_bones -
         it's a no-op with nothing selected (see delete_selected()'s own
@@ -1426,6 +2356,8 @@ class Controller:
         if self.window is None:
             return
 
+        has_rig = bool(self.armature_name)
+
         # Gate on whether an image is actually loaded onto the canvas
         # right now, not on self.data["background"] being a non-empty
         # path string. A stored path can point at a file that no longer
@@ -1435,19 +2367,42 @@ class Controller:
         # these stay enabled against an image the user can't see.
         has_background = self.window.control_list.container.background is not None
 
+        # capture_view() silently does nothing without a panel loaded (the
+        # background is stored per panel), so a rig with no panel yet must
+        # not leave the button looking clickable.
+        self.window.capture_button.setEnabled(has_rig and bool(self.panel_name))
+        self.window.control_list.setEnabled(has_rig)
+
         self.window.add_button.setEnabled(has_background)
         self.window.clear_button.setEnabled(has_background)
         self.window.delete_button.setEnabled(
             has_background and bool(self.selected_bones)
         )
 
-        self.window.symmetry_checkbox.setEnabled(has_background)
-        self.window.ik_fk_checkbox.setEnabled(has_background)
-        self.window.motion_paths_checkbox.setEnabled(has_background)
+        self.window.symmetry_icon.setEnabled(has_background)
+        self.window.symmetry_toggle.setEnabled(has_background)
+
+        # The N-panel's multi-command Add button is gated on the same
+        # "panel has an image" state (custom_actions_quick.
+        # _panel_has_image) - ask Blender to redraw its UI so it
+        # enables/disables right away instead of on the next mouse-over.
+        # Only when that state actually flipped (this method runs on every
+        # selection change), and only the areas that can show the panel.
+        if has_background != getattr(self, "_last_has_background", None):
+            self._last_has_background = has_background
+            try:
+                for blender_window in bpy.context.window_manager.windows:
+                    for area in blender_window.screen.areas:
+                        if area.type == 'VIEW_3D':
+                            area.tag_redraw()
+            except Exception:
+                pass
+
 
     def refresh(self):
         if self.window is None:
             return
+
 
         self.window.control_list.clear_controls()
 
@@ -1488,32 +2443,34 @@ class Controller:
         # background above has just been (re)loaded.
         self._ensure_symmetry_default()
 
-        # Sync the checkbox to match the loaded armature's stored value.
-        # blockSignals() prevents this from re-triggering toggle_symmetry(),
-        # which would otherwise immediately re-save the value we just loaded
-        # (harmless, but pointless) and could clobber symmetry_x if the
-        # background isn't set up yet.
-        self.window.symmetry_checkbox.blockSignals(True)
-        self.window.symmetry_checkbox.setChecked(
+        # Sync the toggle button to match the loaded armature's stored
+        # value. blockSignals() prevents this from re-triggering
+        # toggle_symmetry(), which would otherwise immediately re-save
+        # the value we just loaded (harmless, but pointless) and could
+        # clobber symmetry_x if the background isn't set up yet.
+        self.window.symmetry_toggle.blockSignals(True)
+        self.window.symmetry_toggle.setChecked(
             self.data.get("symmetry", False)
         )
-        self.window.symmetry_checkbox.blockSignals(False)
+        self.window.symmetry_toggle.blockSignals(False)
 
-        self.window.ik_fk_checkbox.blockSignals(True)
-        self.window.ik_fk_checkbox.setChecked(
-            self.data.get("ik_fk_enabled", False)
-        )
-        self.window.ik_fk_checkbox.blockSignals(False)
+        # Restore each draggable overlay widget's (currently just Quick
+        # Action buttons/toggles - see sync_quick_actions()) saved
+        # custom position (if it's ever been dragged) - same idea as
+        # symmetry_x above, just per-widget. A key that's missing (or
+        # whose stored value is None/empty) leaves that widget on the
+        # default stacked layout, matching a rig that's never had this
+        # widget moved.
+        saved_overlay_positions = self.data.get("overlay_positions") or {}
+        canvas.overlay_positions = {
+            key: (
+                QPoint(saved_overlay_positions[key][0], saved_overlay_positions[key][1])
+                if saved_overlay_positions.get(key)
+                else None
+            )
+            for key in canvas.OVERLAY_DRAG_GROUPS
+        }
 
-        canvas.ikfk_controls_enabled = self.data.get("ik_fk_enabled", False)
-
-        self.window.motion_paths_checkbox.blockSignals(True)
-        self.window.motion_paths_checkbox.setChecked(
-            self.data.get("motion_paths_enabled", False)
-        )
-        self.window.motion_paths_checkbox.blockSignals(False)
-
-        canvas.motion_paths_controls_enabled = self.data.get("motion_paths_enabled", False)
         canvas.update_overlay_buttons()
 
         self._update_action_controls_enabled()
@@ -1536,23 +2493,31 @@ class Controller:
             )
 
             # A control with no saved position yet gets auto-placed by
-            # add_control()'s own fallback grid, based purely on where it
-            # falls in this list AT THIS MOMENT (its index among however
-            # many controls exist right now). Never persisting that
-            # computed position back into self.data meant every single
-            # refresh() recomputed it from scratch - so deleting an
-            # earlier control (or adding a new one anywhere before it)
-            # shifted every OTHER still-unpositioned control's grid index,
-            # making them silently jump to new spots even though nothing
-            # about them was touched. Saving it back the very first time
-            # locks that control's position in for good from then on -
-            # exactly as if the user had dragged it there themselves -
-            # so later deletions/additions elsewhere in the list can no
-            # longer move it.
+            # add_control()'s own fallback grid: the first default slot
+            # that isn't already occupied by another control's actual
+            # position (see PickerCanvas._next_grid_position()). Never
+            # persisting that computed position back into self.data
+            # meant every single refresh() recomputed it from scratch -
+            # so deleting an earlier control (or adding a new one
+            # anywhere before it) could shift which slot a still-
+            # unpositioned control landed on, making it silently jump
+            # to a new spot even though nothing about it was touched.
+            # Saving it back the very first time locks that control's
+            # position in for good from then on - exactly as if the
+            # user had dragged it there themselves - so later
+            # deletions/additions elsewhere in the list can no longer
+            # move it.
             if had_no_position and control is not None:
                 item["x"] = control.image_position.x()
                 item["y"] = control.image_position.y()
                 positions_pinned = True
+
+            # Restore whether this position came from an actual drag (or
+            # the symmetric reflection of one) vs. still just sitting on
+            # its auto-placed grid default - add_selected()'s mirroring
+            # check relies on this to tell the two apart.
+            if control is not None:
+                control.manually_positioned = item.get("manually_positioned", False)
 
             widget = self.window.control_list.controls[item["bone_name"]]
             self.window.connect_item(widget)
@@ -1591,12 +2556,50 @@ class Controller:
 
             self._redraw_all_areas()
 
-        self.refresh_ikfk_label()
+        # Every widget refresh() just (re)built starts fully enabled
+        # (CircleControl's own default) regardless of whether its
+        # bone's collection happens to be hidden right now - set that
+        # correctly immediately rather than waiting for the next poll
+        # tick (see refresh_bone_collection_visibility_states(), which
+        # also runs on every poll tick to catch a collection's
+        # visibility being toggled directly in the Armature Properties
+        # panel, something no picker action would otherwise notice).
+        self.refresh_bone_collection_visibility_states(rig=rig)
+
+        self.refresh_custom_action_enabled_states()
+
+    def refresh_bone_collection_visibility_states(self, rig=None):
+        """Keeps every control widget's enabled/disabled state in sync
+        with whether its bone's collection is currently visible in
+        Blender (see CircleControl.set_bone_collection_visible()) - a
+        hidden-collection bone can't actually be selected in the
+        viewport at all, so its control shouldn't be clickable either.
+
+        Called from refresh() (so a freshly (re)built canvas starts
+        correct immediately) and unconditionally from
+        backend.poll_active_armature() every tick, since toggling a
+        collection's visibility in the Armature Properties panel
+        doesn't go through any picker action at all - nothing else
+        would ever notice that change without polling for it.
+        """
+        if self.window is None:
+            return
+
+        if rig is None:
+            rig = backend.arm()
+
+        if not rig or rig.type != "ARMATURE" or rig.name != self.armature_name:
+            return
+
+        for name, widget in self.window.control_list.controls.items():
+            pb = rig.pose.bones.get(name)
+            visible = pb is None or backend.is_bone_collection_visible(pb)
+            widget.set_bone_collection_visible(visible)
 
     # ---------------------------------------------------------
 
     def add_selected(self):
-        from ..backend import arm, mirror_name, control_dimensions
+        from ..backend import arm, mirror_name, control_dimensions, is_bone_collection_visible
 
         rig = arm()
         if not rig:
@@ -1639,12 +2642,12 @@ class Controller:
             # bone's collection hidden") is therefore wrong: it misses
             # bones that really are only hidden via a collection, and it
             # wrongly blocks any bone that merely has a stray bone.hide
-            # flag set. Checking collection visibility directly fixes
-            # both cases. A bone with no collections at all is never
-            # hidden by this check, since collections only ever restrict
-            # visibility for bones actually assigned to one.
-            collections = list(pb.bone.collections)
-            if collections and not any(c.is_visible for c in collections):
+            # flag set. Checking collection visibility directly (via the
+            # shared is_bone_collection_visible()) fixes both cases. A
+            # bone with no collections at all is never hidden by this
+            # check, since collections only ever restrict visibility for
+            # bones actually assigned to one.
+            if not is_bone_collection_visible(pb):
                 skipped_hidden.append(pb.name)
                 continue
 
@@ -1661,6 +2664,7 @@ class Controller:
                 "control_shape": self.default_control_shape,
                 "control_color": self.default_control_color,
                 "hidden": False,
+                "manually_positioned": False,
             }
 
             mirror = mirror_name(pb.name)
@@ -1668,26 +2672,28 @@ class Controller:
             if self.data.get("symmetry") and mirror is not None:
                 mirror_item = self.find_item(mirror)
 
-                # Same sentinel gap as the resize/reshape fix above: a
-                # mirror control that was itself just added and never
-                # dragged still has mirror_item["x"]/["y"] stuck at the
-                # -1.0 "unset" sentinel, even though it already has a
-                # real position via its widget's image_position. Gating
-                # on the data sentinel alone meant adding a new control
-                # whose mirror was freshly auto-placed (not yet dragged)
-                # silently fell back to the default grid position instead
-                # of being placed symmetrically opposite it. Prefer the
-                # live widget's position when one exists, and only fall
-                # back to the stored data position otherwise.
+                # Only mirror off of a position the user actually put
+                # there on purpose (a real drag, or the symmetric
+                # reflection of one) - not wherever the mirror control
+                # happens to be currently sitting from its own auto-
+                # placed grid default. Otherwise a fresh, never-dragged
+                # mirror's incidental grid slot would get treated as a
+                # deliberate symmetry anchor, pulling this new control
+                # off to mirror a coincidence instead of a real position.
+                # A control not yet flushed to self.data (mirror_item
+                # missing/stale) is checked on its live widget first,
+                # since that's the more current source during this same
+                # add_selected() call - see the sentinel-gap note this
+                # replaced, now gated on manually_positioned as well.
                 mirror_widget = self.window.control_list.controls.get(mirror)
 
-                if mirror_widget is not None and hasattr(
-                    mirror_widget, "image_position"
+                if mirror_widget is not None and getattr(
+                    mirror_widget, "manually_positioned", False
                 ):
                     mirror_x = mirror_widget.image_position.x()
                     mirror_y = mirror_widget.image_position.y()
                     mirror_has_position = True
-                elif mirror_item and mirror_item["x"] >= 0 and mirror_item["y"] >= 0:
+                elif mirror_item and mirror_item.get("manually_positioned"):
                     mirror_x = mirror_item["x"]
                     mirror_y = mirror_item["y"]
                     mirror_has_position = True
@@ -1711,6 +2717,7 @@ class Controller:
 
                     new_item["x"] = new_center - width / 2.0
                     new_item["y"] = mirror_y
+                    new_item["manually_positioned"] = True
 
             # Snapshot lazily, right before the first control this call
             # actually adds - not up front, before we even know whether
@@ -1825,7 +2832,86 @@ class Controller:
         # side selection change, the same way undo()/redo() already do.
         self._sync_viewport_selection()
 
-        self.refresh_ikfk_label()
+        self.refresh_custom_action_enabled_states()
+
+    def box_select(self, bone_names):
+        """Adds every control whose on-canvas geometry intersected a
+        Shift+drag rubber-band box (see PickerCanvas.mousePressEvent/
+        mouseMoveEvent/mouseReleaseEvent) to the current selection.
+
+        Always additive - union with whatever was already selected, the
+        same way a single Shift+click adds to the selection in
+        select_control() above. Box select is only ever started with
+        Shift held in the first place (a plain drag on empty canvas
+        does the usual background-image drag instead), so there's no
+        non-additive box-select gesture to support here - this never
+        replaces the existing selection the way a shift-less click
+        does in select_control().
+        """
+        new_selection = self.selected_bones | set(bone_names)
+
+        # Every hit control was already selected - nothing actually
+        # changes, so don't push a no-op undo step.
+        if new_selection == self.selected_bones:
+            return
+
+        self._record_undo_snapshot(selection_only=True)
+
+        self.selected_bones = new_selection
+
+        for name, widget in self.window.control_list.controls.items():
+            widget.active = (name in self.selected_bones)
+            widget.update()
+
+        # Match select_control()'s combobox behavior: with multiple
+        # controls now selected, show whichever one was box-selected
+        # last (arbitrary but stable) so the size/shape/color fields
+        # reflect something concrete instead of being left showing
+        # whatever single control was selected before this box select.
+        item = self.find_item(bone_names[-1])
+
+        if item:
+            self.window.set_selected_control(
+                item["control_size"],
+                item["control_shape"],
+                item["control_color"],
+            )
+
+        self._update_action_controls_enabled()
+
+        # Everything above only touches Qt widgets (control highlights
+        # via widget.update(), the delete/symmetry/etc buttons via
+        # setEnabled(), the combos via set_selected_control()) - cheap,
+        # and all that's actually visible to the user. Flush it right
+        # here, before the slower bpy.ops work below, for the same
+        # reason as PickerAreaButton._apply_style() in main_window.py:
+        # widget.update()/setEnabled() only *schedule* a repaint, which
+        # can sit pending until some unrelated event forces it through
+        # inside Blender's own event loop (it doesn't pump Qt
+        # continuously). Flushing AFTER _sync_viewport_selection()
+        # instead (as this used to) meant every bit of visible feedback
+        # had to wait on that loop of bpy.ops.rp.select() calls first -
+        # one Blender operator call per selected bone - which is what
+        # made the whole thing feel delayed again, this time end to
+        # end. Flushing here instead means the highlights and buttons
+        # appear immediately, and the viewport sync (which has nothing
+        # to do with what's on screen in this Qt window) can take
+        # however long it needs afterward without blocking that.
+        # Direct synchronous repaint of the picker window, NOT a nested
+        # QApplication.processEvents(): this runs inside a mouse-click
+        # handler, and pumping the whole event queue from there re-enters
+        # event dispatch (further clicks/hover events/Python overrides)
+        # mid-handler - a native-crash risk.
+        if self.window is not None:
+            self.window.repaint()
+
+        # Same reasoning as select_control()'s own call: keep
+        # backend._LAST_SELECTED_BONES in lockstep with the viewport so
+        # a silently-failed rp.select operator can't leave stale bones
+        # free to get synced back into self.selected_bones later.
+        self._sync_viewport_selection()
+
+        self.refresh_custom_action_enabled_states()
 
     def sync_selection_from_blender(self, selected_bone_names):
         """Called from backend.poll_active_armature when the set of
@@ -1885,7 +2971,7 @@ class Controller:
 
         self._update_action_controls_enabled()
 
-        self.refresh_ikfk_label()
+        self.refresh_custom_action_enabled_states()
 
     def set_selected_size(self, size):
         self._set_selected_appearance(size=size)
@@ -1896,14 +2982,67 @@ class Controller:
     def set_selected_color(self, color):
         self._set_selected_appearance(color=color)
 
+    def sync_mirror_color(self, color):
+        """Runs whenever the color dropdown is ACTIVATED - i.e. the user
+        clicked an entry, including the color it already shows (the
+        dropdown's currentIndexChanged doesn't fire for that, so
+        set_selected_color() never runs for a re-pick).
+
+        If Symmetry is off, or nothing is selected, or no selected control
+        has a mirror partner: nothing to do. Otherwise each partner that
+        doesn't already have `color` is recolored; partners that already
+        match are left alone, and when every one matches no snapshot, save
+        or redraw happens at all. (After a normal color change the partner
+        was already synced by _set_selected_appearance(), so this is then a
+        pure no-op check.)
+        """
+        if color is None or not self.data.get("symmetry") or not self.selected_bones:
+            return
+
+        from ..backend import mirror_name
+
+        items = {item["bone_name"]: item for item in self.data["items"]}
+
+        stale = []
+        for bone_name in self.selected_bones:
+            item = items.get(bone_name)
+            mirror_bone = mirror_name(bone_name)
+            mirror_item = items.get(mirror_bone) if mirror_bone else None
+            if item is None or mirror_item is None or mirror_item is item:
+                continue
+            if mirror_item.get("control_color") != color and mirror_item not in stale:
+                stale.append(mirror_item)
+
+        if not stale:
+            return
+
+        self._record_undo_snapshot()
+        for mirror_item in stale:
+            mirror_item["control_color"] = color
+            widget = self.window.control_list.controls.get(mirror_item["bone_name"])
+            if widget:
+                widget.set_appearance(color=color)
+        self.save()
+
     def _set_selected_appearance(self, size=None, shape=None, color=None):
         if not self.selected_bones:
             # Nothing selected - the combos are showing/editing the
             # *default* appearance (see set_no_selection_defaults()),
-            # not any actual control, so update that default instead
-            # of touching picker data. Not undoable and not saved to
-            # disk: it's a live default for controls not created yet,
-            # not a change to anything that already exists.
+            # not any actual control. Still an operation the rigger
+            # made though, so it's undoable/redoable like anything
+            # else (see default_control_size/shape/color in
+            # _record_undo_snapshot()) - just not saved to disk on its
+            # own, since self.data itself never changes here: it's a
+            # live default for controls not created yet, not a change
+            # to anything that already exists.
+            #
+            # defaults_only=True: this only runs because nothing is
+            # selected, so its own undo step should restore selection to
+            # genuinely empty rather than resurrecting whatever was
+            # selected before an incidental deselect - see
+            # _record_undo_snapshot()'s defaults_only docstring.
+            self._record_undo_snapshot(defaults_only=True)
+
             if size is not None:
                 self.default_control_size = size
 
@@ -1913,6 +3052,8 @@ class Controller:
             if color is not None:
                 self.default_control_color = color
 
+            # Auto-save: the defaults live with the loaded panel.
+            self._save_panel_defaults()
             return
 
         self._record_undo_snapshot()
@@ -2076,32 +3217,12 @@ class Controller:
         self.window.control_list.container.layout_controls()
         self.save()
 
-    def calculate_motion_path(self):
-        if not self.selected_bones:
-            return
-
-        self._record_undo_snapshot(clear_motion_path=True)
-        bpy.ops.rp.calculate_path()
-
-    def clear_motion_path(self):
-        if not self.selected_bones:
-            return
-
-        # Missing an undo snapshot here meant clicking "Clear" (the "x"
-        # button) wasn't undoable at all - Ctrl+Z right after clicking it
-        # would skip straight past this action and revert whatever REAL
-        # operation happened before it instead, which is both surprising
-        # and inconsistent with calculate_motion_path() (the "Calculate"
-        # button), which already records one. recalculate_motion_path=True
-        # tells undo() to re-run rp.calculate_path() when this snapshot
-        # is stepped back through, bringing the just-cleared path back -
-        # the exact mirror of what clear_motion_path=True already does
-        # for the Calculate button.
-        self._record_undo_snapshot(recalculate_motion_path=True)
-        bpy.ops.rp.clear_path()
-
     def show_all(self):
-        self._record_undo_snapshot()
+        # Only a step of its own when it actually changes picker data: a
+        # Show All with nothing hidden would otherwise cost a Ctrl+Z
+        # press that does nothing (same reasoning as add_selected()).
+        if any(item.get("hidden", False) for item in self.data["items"]):
+            self._record_undo_snapshot()
         bpy.ops.rp.show_all()
 
         for item in self.data["items"]:
@@ -2111,7 +3232,9 @@ class Controller:
     # ---------------------------------------------------------
 
     def hide_all(self):
-        self._record_undo_snapshot()
+        # See show_all(): no snapshot when every control is already hidden.
+        if any(not item.get("hidden", False) for item in self.data["items"]):
+            self._record_undo_snapshot()
         bpy.ops.rp.hide_all()
 
         for item in self.data["items"]:
@@ -2119,23 +3242,43 @@ class Controller:
         self.save()
 
     def capture_view(self):
-        if not self.armature_name:
+        if not self.armature_name or not self.panel_name:
             return
 
-        bpy.ops.rp.capture_view()
+        result = bpy.ops.rp.capture_view()
 
-        # RP_OT_CaptureView always renders to this fixed, shared temp path.
+        # RP_OT_CaptureView writes to this same (per-process) temp path
+        # on every successful capture, so it's never cleaned up between
+        # calls - a failed capture (e.g. no VIEW_3D area visible right
+        # now) would otherwise leave whatever an EARLIER successful
+        # capture wrote still sitting there. Checking the operator's own
+        # result (rather than just os.path.exists(temp_path), which
+        # would be true from that stale leftover) is what tells "this
+        # capture actually just ran" apart from "some previous capture
+        # ran, this one didn't" - without it, a failed capture would
+        # silently overwrite this rig's background with a stale,
+        # outdated screenshot instead of leaving it untouched.
+        if 'FINISHED' not in result:
+            return
+
+        # Must match RP_OT_CaptureView.execute()'s own path exactly
+        # (see backend.py) - PID-scoped rather than a fixed shared name
+        # so two separate Blender processes capturing around the same
+        # moment can never interleave on the same temp file.
         temp_path = os.path.join(
             tempfile.gettempdir(),
-            "rig_picker_capture.png"
+            f"rig_picker_capture_{os.getpid()}.png"
         )
 
         if not os.path.exists(temp_path):
             return
 
-        # Copy it into this armature's own dedicated image file so it can
-        # never be overwritten by capturing a different armature's view.
-        dest_path = json_manager.get_image_path(self.armature_name)
+        # Copy it into this (rig, panel) pair's own dedicated image file
+        # so it can never be overwritten by capturing a different
+        # panel's - on this rig or any other - view.
+        dest_path = json_manager.get_image_path(
+            self.armature_name, self.panel_name, ensure_folder=True
+        )
 
         self._record_undo_snapshot()
 
@@ -2148,7 +3291,30 @@ class Controller:
         # at the new one.
         self._stage_image_backup(dest_path)
 
-        shutil.copyfile(temp_path, dest_path)
+        try:
+            shutil.copyfile(temp_path, dest_path)
+        except OSError as e:
+            # Full disk, read-only/synced folder, antivirus lock... Left
+            # unhandled this escaped the Qt slot as a bare traceback with
+            # no feedback, after the undo snapshot above had already been
+            # recorded. Nothing in self.data has changed yet, so the
+            # leftover snapshot is a harmless no-op undo step.
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self.window,
+                "Capture View",
+                f"Couldn't save the captured image to:\n{dest_path}\n\n{e}",
+            )
+            return
+        finally:
+            # The per-process temp capture has been consumed (or failed);
+            # don't leave a PNG behind in the temp folder for every
+            # session. Whether a capture just ran is decided by the
+            # operator's result above, never by this file existing.
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
         self.data["background"] = dest_path
         self.data["image_offset_x"] = 0.0
@@ -2194,41 +3360,117 @@ class Controller:
         self._sync_viewport_selection()
 
     def clear_all(self):
-        self._record_undo_snapshot()
+        """Wipes EVERY panel this rig has - not just the one currently
+        showing - and leaves the rig with a single fresh default panel,
+        the same empty state a brand new rig starts with.
 
-        self.data["items"] = []
+        "Clear All" used to be scoped to just self.data (the currently
+        loaded panel), a leftover from before per-panel scoping existed -
+        back when a rig had exactly one implicit panel, clearing "the
+        current panel" and clearing "the whole rig" were the same thing.
+        Once a rig could have several panels (Face, Body, ...), that old
+        scoping quietly became "clear only whichever panel happens to be
+        open", leaving every other panel's controls/background untouched
+        despite the button still saying "Clear All". This restores the
+        original whole-rig meaning: every panel's stored data (and its
+        captured-view image) is removed, then exactly one blank "Panel 1"
+        is created and loaded, mirroring what already happens when a
+        rig's last remaining panel is deleted via Manage Panels.
+        """
+        armature_name = self.armature_name
+        if not armature_name:
+            return
 
-        # Clear the captured background too, not just the controls - but
-        # don't delete the actual image file from disk yet. This clear
-        # is still undoable (up to UNDO_STACK_DEPTH operations deep),
-        # and undo() restores self.data["background"] to point back at
-        # this same path, so deleting the file now would make undo bring
-        # back a reference to a file that no longer exists. Instead,
-        # stage it for deletion on the snapshot _record_undo_snapshot()
-        # just pushed above: _settle_snapshot_pending_image() removes it
-        # for real once that snapshot is no longer reachable - either it
-        # falls off the back of this rig's undo stack, this rig gets
-        # deleted from the scene entirely, or the picker window closes.
-        image_path = self.data.get("background")
+        quick_settings = getattr(bpy.context.scene, "rp_quick_action_settings", None)
 
-        self.data["background"] = ""
-        self.data["image_offset_x"] = 0.0
-        self.data["image_offset_y"] = 0.0
+        # Every (rig, panel) pair's undo/redo history for THIS rig is about
+        # to point at panels that no longer exist, so it is taken OUT of the
+        # live dicts - but NOT thrown away: it is parked on the Clear All's
+        # own entry (below) and put back when that Clear All is undone, so
+        # Ctrl+Z can keep walking back through everything done before it.
+        # Only when there is no entry to park it on (nothing was stored, so
+        # the Clear All can't be undone anyway) is it settled and dropped.
+        rig_history = self.stash_rig_history(armature_name)
 
-        # Reset the Symmetry / IK-FK / Motion Paths checkboxes and the
-        # symmetry guide's saved position along with everything else -
-        # "Clear All" previously only cleared controls and the
-        # background, silently leaving these checked/positioned from
-        # before. A cleared rig with no background/controls has nothing
-        # for symmetry to mirror across or IK/FK-snap between anyway, so
-        # leaving them on was more confusing than useful. This also
-        # means a fresh symmetry_x will get computed cleanly (in the
-        # current image-space, not a stale one) if the user re-enables
-        # Symmetry after loading a new background.
-        self.data["symmetry"] = False
-        self.data["symmetry_x"] = -1.0
-        self.data["ik_fk_enabled"] = False
-        self.data["motion_paths_enabled"] = False
+        # Take every panel's data - items, background capture image,
+        # symmetry, everything - for this rig out of rig_picker_data.json.
+        # Done as a REVERSIBLE backup instead of an outright delete: the
+        # rows/buttons removed below are scene data, so Ctrl+Z restores
+        # them by itself, and without the layouts coming back too they'd
+        # all be empty. custom_actions_quick keeps the backup for a grace
+        # period and restores it when it sees the rows come back (see
+        # _update_rig_clears_after_undo()).
+        from .. import custom_actions_quick
+        original_uids = []
+        if quick_settings is not None:
+            original_uids = [
+                custom_actions_quick._panel_uid(p)
+                for p in quick_settings.panels
+                if p.armature_name == armature_name
+            ]
+        clear_entry = custom_actions_quick.schedule_rig_clear(
+            armature_name,
+            json_manager.backup_armature_data(armature_name),
+            original_uids,
+        )
+        # Remembered, with a copy of the scene rows about to be removed, so
+        # picker Ctrl+Z / Ctrl+Shift+Z can undo/redo this Clear All itself
+        # (see undo()/redo()).
+        if not hasattr(self, "_clear_entries"):
+            self._clear_entries = {}
+        self._clear_entries[armature_name] = clear_entry
+        if clear_entry is not None:
+            clear_entry["history"] = rig_history
+        else:
+            self.settle_rig_history(rig_history)
+        if quick_settings is not None:
+            custom_actions_quick.keep_clear_scene_snapshot(
+                clear_entry, quick_settings, armature_name
+            )
+
+        # self.panel_name still names a panel whose data was just
+        # deleted above - clear the in-memory reference DIRECTLY rather
+        # than routing through change_panel()/_switch_to_panel(), whose
+        # first step is to save() whatever was loaded before switching,
+        # which would simply write self.data straight back out under
+        # that now-deleted name, silently resurrecting it.
+        self.panel_name = None
+        self.data = json_manager.new_panel_data()
+
+        # Remove every RP_QuickPanel row belonging to this rig from the
+        # Manage Panels N-panel list too - not just the JSON data - so
+        # the list doesn't keep showing panels whose data no longer
+        # exists. Iterate back-to-front so removing by index is safe.
+        if quick_settings is not None:
+            for i in range(len(quick_settings.panels) - 1, -1, -1):
+                if quick_settings.panels[i].armature_name == armature_name:
+                    quick_settings.panels.remove(i)
+
+            # Every panel this rig had just got wiped above, and Section
+            # 1's multi-command buttons are scoped to (rig, panel) - none
+            # of them have a panel left to belong to. Remove every one of
+            # this rig's, the same orphaned-data cleanup
+            # RP_OT_quick_remove_panel does for a single deleted panel,
+            # just scoped to "every panel of this rig" here since Clear
+            # All deletes them all at once.
+            for i in range(len(quick_settings.multi_actions) - 1, -1, -1):
+                if quick_settings.multi_actions[i].armature_name == armature_name:
+                    quick_settings.multi_actions.remove(i)
+
+            # Manage Panels (like the Qt picker's own Panel dropdown) has
+            # nothing sensible to show with this rig now having zero
+            # panels - recreate its default "Panel 1" immediately rather
+            # than waiting for the next poll tick's
+            # _ensure_default_panel_for_rig() to notice, so the picker
+            # and the N-panel list both already show it the moment this
+            # returns.
+            custom_actions_quick._ensure_default_panel_for_rig(quick_settings, armature_name)
+            custom_actions_quick.note_rig_clear_default(
+                clear_entry, quick_settings, armature_name
+            )
+
+        self.panel_name = "Panel 1"
+        self.data = json_manager.new_panel_data()
 
         # Same reset load_armature()/change_armature() already do when
         # switching rigs (see their matching comments) - the size/shape/
@@ -2240,11 +3482,19 @@ class Controller:
         self.default_control_shape = "CIRCLE"
         self.default_control_color = "GREEN"
 
+        # Persist the fresh "Panel 1" entry right away, rather than
+        # waiting for some later action to trigger the first save() -
+        # a rig that's just been cleared should already show up in
+        # rig_picker_data.json with its new blank default panel, not
+        # only once something happens to touch it again.
         self.save()
 
-        snapshot = self._current_snapshot()
-        if snapshot is not None:
-            snapshot["pending_image_delete"] = image_path or None
+        # Clear All just deleted this rig's multi-command buttons from the
+        # scene. The (rig, panel) pair can end up identical to what was
+        # loaded before ("Panel 1" -> "Panel 1"), so the poll tick's key
+        # comparison wouldn't notice - drop their canvas widgets now.
+        if self.window is not None:
+            self.window.sync_quick_actions()
 
         # Clearing the picker's controls shouldn't leave bones hidden or
         # selected in the viewport.
@@ -2258,11 +3508,81 @@ class Controller:
         # whatever was selected/tweaked right before the clear.
         self.window.set_no_selection_defaults()
 
+        # No extra Blender undo step is pushed here: _show_all_and_deselect()
+        # above already runs bpy.ops.rp.show_all() (pose.reveal), which
+        # pushes the one step that undo() below reverses. A second step
+        # would leave undo() stopping halfway, on a state where the rows
+        # are still gone.
+
+    def _clear_all_entry(self, wanted_state):
+        """This rig's Clear All entry if it is still being tracked and in
+        `wanted_state` ("cleared" = can be undone, "undone" = can be redone)."""
+        from .. import custom_actions_quick
+        entry = getattr(self, "_clear_entries", {}).get(self.armature_name)
+        if (entry is not None
+                and entry in custom_actions_quick._PENDING_RIG_CLEARS
+                and entry["state"] == wanted_state):
+            return entry
+        return None
+
+    def _confirm_delete_used_controls(self, quick_refs):
+        """Yes/No prompt shown by delete_selected() when the controls being
+        deleted are used as Control shape bones on multi-command buttons.
+        Returns True only on Yes; No (or closing the box) cancels."""
+        from PySide6.QtWidgets import QMessageBox
+
+        bone_count = len({name for _a, _i, names in quick_refs for name in names})
+        plural = bone_count != 1
+
+        lines = [
+            f'\u2022 {action.name or "Unnamed button"} \u2013 '
+            f'Command {rule_index + 1}: {", ".join(bone_names)}'
+            for action, rule_index, bone_names in quick_refs
+        ]
+        max_lines = 10
+        if len(lines) > max_lines:
+            extra = len(lines) - max_lines
+            lines = lines[:max_lines] + [f"\u2026and {extra} more"]
+
+        if plural:
+            headline = "Delete these controls?"
+            intro = (
+                "These controls are used as Control shape bones in "
+                "Multi Command Buttons:"
+            )
+            yes_text = (
+                "Yes: the controls are deleted from the picker and removed "
+                "from these buttons."
+            )
+        else:
+            headline = "Delete this control?"
+            intro = (
+                "This control is used as a Control shape bone in a "
+                "Multi Command Button:"
+            )
+            yes_text = (
+                "Yes: the control is deleted from the picker and removed "
+                "from this button."
+            )
+
+        box = QMessageBox(
+            QMessageBox.Warning,
+            "Delete Control",
+            headline,
+            QMessageBox.Yes | QMessageBox.No,
+            self.window,
+        )
+        box.setInformativeText(
+            intro + "\n\n" + "\n".join(lines) + "\n\n"
+            + yes_text + "\nNo: the operation is cancelled and nothing is changed."
+        )
+        box.setDefaultButton(QMessageBox.No)
+        box.setEscapeButton(QMessageBox.No)
+        return box.exec() == QMessageBox.Yes
+
     def delete_selected(self):
         if not self.selected_bones:
             return
-
-        self._record_undo_snapshot()
 
         selected = set(self.selected_bones)
 
@@ -2284,11 +3604,52 @@ class Controller:
                 if mirror_bone and mirror_bone in existing_bones:
                     selected.add(mirror_bone)
 
+        # A control whose bone is listed as a Control shape bone on one of
+        # this panel's multi-command buttons can't just disappear: ask first.
+        # No -> nothing is changed at all. Yes -> the control is deleted AND
+        # the bone is removed from those buttons' Control shape bones.
+        from .. import custom_actions_quick
+        quick_refs = custom_actions_quick.find_control_bone_references(
+            self.armature_name, self.panel_name, selected
+        )
+        if quick_refs and not self._confirm_delete_used_controls(quick_refs):
+            return
+
+        # The controls about to be deleted, with their positions, kept so a
+        # native Blender undo of this delete can put them back (see
+        # custom_actions_quick.register_control_delete()).
+        deleted_items = [
+            (index, item) for index, item in enumerate(self.data["items"])
+            if item["bone_name"] in selected
+        ] if quick_refs else []
+
+        self._record_undo_snapshot()
+
         self.data["items"] = [
             item for item in self.data["items"]
             if item["bone_name"] not in selected
         ]
         self.save()
+
+        if quick_refs:
+            removed = custom_actions_quick.remove_control_bone_references(
+                self.armature_name, self.panel_name, selected
+            )
+            # The picker's own Ctrl+Z only reverts picker layout data - it
+            # never writes into Blender scene data (see undo()), and the
+            # Multi Command Buttons' Control shape bone lists are scene
+            # data. So this removal is undone by Blender's own undo only,
+            # via the native step registered below.
+            if removed:
+                # Also make this a step on Blender's own undo stack, and
+                # remember it, so viewport Ctrl+Z / Ctrl+Shift+Z keep the
+                # buttons and the picker's controls in step too.
+                custom_actions_quick.register_control_delete(
+                    self.armature_name, self.panel_name, deleted_items, removed
+                )
+                custom_actions_quick.push_native_undo_step("Delete Picker Control")
+            self._redraw_all_areas()
+            custom_actions_quick._sync_quick_picker_ui()
 
         self.selected_bones.clear()
 
@@ -2311,57 +3672,64 @@ class Controller:
         self._show_all_and_deselect()
         self.refresh()
 
-    def select_all(self):
+    def _selectable_control_names(self, rig):
+        """Names of the picker controls that can be selected right now.
+
+        A control that is greyed out in the picker (setEnabled(False), see
+        CircleControl.set_bone_collection_visible()) is never selectable:
+        the widget's own state is what the user sees, and it is also how
+        box select decides. On top of that, with a rig, a bone whose
+        collection is hidden can't really be selected in the viewport
+        either (_sync_viewport_selection() drops it), so it is left out
+        here too - marking it active in the picker would only get silently
+        corrected on the next ~0.15s poll tick."""
+        from ..backend import is_bone_collection_visible
+
+        controls = {
+            name for name, widget in self.window.control_list.controls.items()
+            if widget.isEnabled()
+        }
+        if rig and rig.type == "ARMATURE":
+            return {
+                name for name in controls
+                if name in rig.pose.bones
+                and is_bone_collection_visible(rig.pose.bones[name])
+            }
+        return controls
+
+    def _set_picker_selection(self, new_selection):
+        """Makes `new_selection` (a set of control/bone names) the picker's
+        selection and pushes it to the viewport. Shared by select_all() and
+        invert_selection()."""
         # Same reasoning as select_control(): a plain selection change
         # gets its own selection_only snapshot, so it stays individually
         # undoable unless a real operation immediately follows, in which
         # case that operation's own push discards this one instead of
-        # stacking on top of it. Skip the push entirely if every control
-        # is already selected - nothing would actually change, so it'd
-        # just be a no-op step eating a Ctrl+Z press.
-        all_bones = set(self.window.control_list.controls.keys())
-        if all_bones != self.selected_bones:
+        # stacking on top of it. Skip the push entirely if nothing would
+        # change - it'd just be a no-op step eating a Ctrl+Z press.
+        if new_selection != self.selected_bones:
             self._record_undo_snapshot(selection_only=True)
-        self.selected_bones = all_bones
+        self.selected_bones = new_selection
 
-        # Update UI widgets
+        # Update UI widgets - only the bones in new_selection end up marked
+        # active, so a control that can't be selected stays visibly
+        # unselected instead of briefly flashing active until the next
+        # poll corrects it.
         for name, widget in self.window.control_list.controls.items():
-            widget.active = True
+            widget.active = (name in new_selection)
             widget.update()
 
-        from ..backend import arm
-        rig = arm()
-
-        from ..backend import (
-            get_3d_override,
-            ensure_pose_mode,
-        )
-
-        if rig and rig.type == "ARMATURE":
-            override = get_3d_override(bpy.context, rig)
-
-            if override:
-                with bpy.context.temp_override(**override):
-                    bpy.context.view_layer.objects.active = rig
-                    ensure_pose_mode(bpy.context, rig)
-
-                    bpy.ops.pose.reveal(select=False)
-                    bpy.ops.pose.select_all(action="SELECT")
+        # Push exactly this selection onto the viewport (select those bones,
+        # hide everything else) in one pass.
+        self._sync_viewport_selection()
 
         # Same leak select_control()/deselect_all()/_show_all_and_deselect()
-        # had: this pushes the viewport selection directly (a bulk
-        # pose.select_all rather than per-bone rp.select calls, since
-        # that's far cheaper for a rig with many controls) but must still
-        # update backend._LAST_SELECTED_BONES itself - nothing else here
-        # does. Left stale, the next poll tick would see the viewport's
-        # now-fully-selected bones as a "change" it needs to sync back in,
-        # which happens to be harmless *if* everything above genuinely
-        # succeeded (it'd just resync to the same set) - but if the reveal/
-        # select_all ever silently failed (get_3d_override() returning
-        # None is already guarded above, but the operators themselves can
-        # still no-op), a stale _LAST_SELECTED_BONES is exactly what lets
-        # a since-invalidated viewport selection get synced back into
-        # self.selected_bones unnoticed later.
+        # had: _sync_viewport_selection() returns early without touching
+        # backend._LAST_SELECTED_BONES when there is no usable 3D view, so
+        # keep it in lockstep with the picker's selection here as well.
+        # Left stale, a viewport selection that never actually changed could
+        # later be synced back into self.selected_bones by the poll tick,
+        # resurrecting a selection the picker UI already moved on from.
         backend._LAST_SELECTED_BONES = frozenset(self.selected_bones)
 
         # Update appearance control dropdowns
@@ -2375,10 +3743,43 @@ class Controller:
                     item["control_shape"],
                     item["control_color"],
                 )
+        else:
+            self.window.set_no_selection_defaults()
 
         self._update_action_controls_enabled()
 
-        self.refresh_ikfk_label()
+        self.refresh_custom_action_enabled_states()
+
+    def select_all(self):
+        """Selects every picker control - and ONLY the picker controls.
+
+        The viewport selection is pushed through _sync_viewport_selection(),
+        the same path a box select or any other multi-control selection
+        uses: it selects exactly those bones and isolates them (hides the
+        rest), like selecting a single control does. It used to reveal every
+        bone and run pose.select_all(SELECT), which selected every visible
+        bone in the rig - controls or not - and left them all showing, i.e.
+        the same viewport result as clicking empty space (Show All)."""
+        from ..backend import arm
+
+        if not self.window.control_list.controls:
+            # No picker controls: there is nothing to select, and the
+            # viewport selection is none of the picker's business.
+            return
+
+        self._set_picker_selection(self._selectable_control_names(arm()))
+
+    def invert_selection(self):
+        """Selects every selectable picker control that is NOT selected now,
+        and deselects the ones that were (greyed-out controls are never
+        selected either way)."""
+        from ..backend import arm
+
+        if not self.window.control_list.controls:
+            return
+
+        selectable = self._selectable_control_names(arm())
+        self._set_picker_selection(selectable - set(self.selected_bones))
 
     def deselect_all(self):
         # No snapshot here: deselect_all() is only ever called when the
@@ -2418,7 +3819,7 @@ class Controller:
 
         self._update_action_controls_enabled()
 
-        self.refresh_ikfk_label()
+        self.refresh_custom_action_enabled_states()
 
     def _ensure_symmetry_default(self):
         """Computes symmetry_x (the image-space X the dashed guide line
@@ -2506,183 +3907,3 @@ class Controller:
         # though the checkbox and guide line looked correct in the
         # current session.
         self.save()
-
-    def toggle_ik_fk_setting(self, enabled):
-        """Persists the IK-FK checkbox state and shows/hides the IK/FK
-        switch plus its two snapping buttons (FK->IK, IK->FK) on the
-        canvas accordingly."""
-        self._record_undo_snapshot()
-
-        self.data["ik_fk_enabled"] = enabled
-
-        canvas = self.window.control_list.container
-        canvas.ikfk_controls_enabled = enabled
-        canvas.update_overlay_buttons()
-
-        # Was missing entirely - unlike its two sibling toggles
-        # (toggle_symmetry(), toggle_motion_paths_setting()), this never
-        # wrote the checkbox state to disk. It looked correct for the
-        # rest of the session (self.data and the canvas were both
-        # updated), but switching to a different rig and back, or
-        # closing and reopening Blender, silently reverted it to
-        # whatever was last actually saved.
-        self.save()
-
-    def toggle_motion_paths_setting(self, enabled):
-        """Persists the Motion Paths checkbox state and shows/hides the
-        Calculate/Clear motion-path buttons on the canvas accordingly."""
-        self._record_undo_snapshot()
-
-        self.data["motion_paths_enabled"] = enabled
-
-        canvas = self.window.control_list.container
-        canvas.motion_paths_controls_enabled = enabled
-        canvas.update_overlay_buttons()
-
-        self.save()
-    def toggle_ik_fk(self):
-
-        parent_bone, group = self._resolve_ikfk_group()
-
-        if parent_bone is None:
-            return
-
-        rig = backend.arm()
-        if rig is None:
-            return
-
-        pb = rig.pose.bones.get(parent_bone)
-        if pb is None or "IK_FK" not in pb:
-            return
-
-        current = float(pb["IK_FK"])
-
-        self._record_undo_snapshot(ikfk_restore=(parent_bone, current))
-
-        pb["IK_FK"] = 0.0 if current >= 0.5 else 1.0
-
-        pb.keyframe_insert(
-            data_path='["IK_FK"]',
-            frame=bpy.context.scene.frame_current
-        )
-
-        rig.update_tag(refresh={'DATA'})
-        bpy.context.view_layer.update()
-
-        self._redraw_all_areas()
-
-        self.refresh_ikfk_label()
-    
-
-    def fk_to_ik(self):
-
-        parent_bone, group = self._resolve_ikfk_group()
-
-        if group is None:
-            return
-
-        all_group_bones = (
-            group["output_bones"]
-            + group["input_bones"]
-            + group["ctrl_bones"]
-            + group.get("tail_bones", [])
-            + group.get("extra_ctrls", [])
-        )
-        pose_restore = self._capture_pose_transforms(all_group_bones)
-        self._record_undo_snapshot(pose_restore=pose_restore)
-
-        rig = backend.arm()
-
-        bpy.context.view_layer.objects.active = rig
-        rig.select_set(True)
-
-        for window in bpy.context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type != "VIEW_3D":
-                    continue
-
-                for region in area.regions:
-                    if region.type != "WINDOW":
-                        continue
-
-                    with bpy.context.temp_override(
-                        window=window,
-                        area=area,
-                        region=region,
-                        active_object=rig,
-                        object=rig,
-                    ):
-
-                        bpy.ops.pose.rigify_generic_snap_oeujyfjmc8c1f286(
-                            output_bones=str(group["output_bones"]).replace("'", '"'),
-                            input_bones=str(group["input_bones"]).replace("'", '"'),
-                            ctrl_bones=str(group["ctrl_bones"]).replace("'", '"'),
-                            tooltip="FK to IK",
-                            locks=(False, False, False),
-                        )
-
-                        bpy.context.view_layer.update()
-
-                        self._redraw_all_areas()
-
-                        self.refresh_ikfk_label()
-                        return
-
-
-    def ik_to_fk(self):
-
-        parent_bone, group = self._resolve_ikfk_group()
-
-        if group is None:
-            return
-
-        all_group_bones = (
-            group["output_bones"]
-            + group["input_bones"]
-            + group["ctrl_bones"]
-            + group.get("tail_bones", [])
-            + group.get("extra_ctrls", [])
-        )
-        pose_restore = self._capture_pose_transforms(all_group_bones)
-        self._record_undo_snapshot(pose_restore=pose_restore)
-
-        rig = backend.arm()
-
-        bpy.context.view_layer.objects.active = rig
-        rig.select_set(True)
-
-        for window in bpy.context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type != "VIEW_3D":
-                    continue
-
-                for region in area.regions:
-                    if region.type != "WINDOW":
-                        continue
-
-                    with bpy.context.temp_override(
-                        window=window,
-                        area=area,
-                        region=region,
-                        active_object=rig,
-                        object=rig,
-                    ):
-
-                        bpy.ops.pose.rigify_limb_ik2fk_oeujyfjmc8c1f286(
-                            prop_bone=parent_bone,
-                            pole_prop="pole_vector",
-
-                            fk_bones=str(group["output_bones"]).replace("'", '"'),
-                            ik_bones=str(group["input_bones"]).replace("'", '"'),
-                            ctrl_bones=str(group["ctrl_bones"]).replace("'", '"'),
-
-                            tail_bones=str(group.get("tail_bones", [])).replace("'", '"'),
-                            extra_ctrls=str(group.get("extra_ctrls", [])).replace("'", '"'),
-                        )
-
-                        bpy.context.view_layer.update()
-
-                        self._redraw_all_areas()
-
-                        self.refresh_ikfk_label()
-                        return

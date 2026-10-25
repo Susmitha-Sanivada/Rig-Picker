@@ -1,0 +1,20 @@
+[flake8]
+# F722 ("syntax error in forward annotation") and F821 ("undefined
+# name") are false positives specific to Blender's
+#     name: bpy.props.StringProperty(name="...", description="...")
+# PropertyGroup field syntax. pyflakes treats the `name: X(...)`
+# PropertyGroup declaration as a PEP 526 variable annotation and tries
+# to parse the string arguments inside it as forward references - Qt/
+# bpy code doesn't have a real `bpy` module to resolve against in a
+# plain lint environment, so this fires on every StringProperty/
+# EnumProperty/etc. field. It is not a real bug - see the addon README
+# / AUDIT_NOTES.md for the reproduction.
+#
+# custom_actions_quick.py is the only file in this addon that declares
+# bpy.props fields at module scope, so the ignore is scoped to just
+# that file rather than disabled project-wide.
+per-file-ignores =
+    custom_actions_quick.py:F722,F821
+
+max-line-length = 100
+exclude = vendor,python

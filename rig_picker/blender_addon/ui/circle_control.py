@@ -11,10 +11,12 @@ from PySide6.QtGui import (
     QPainter,
     QPen,
     QBrush,
-    QPolygonF,
     QPainterPath,
 )
 from PySide6.QtWidgets import QWidget
+
+
+from .safe_qt import safe_override
 
 
 class CircleControl(QWidget):
@@ -48,6 +50,16 @@ class CircleControl(QWidget):
         self.drag_offset = None
         self._press_pos = None
         self.active = False
+
+        # True once this control's position has been explicitly set by
+        # the user (a real drag, or the symmetric reflection of one) -
+        # as opposed to still sitting wherever it was auto-placed by
+        # PickerCanvas._next_grid_position(). Distinguishes "this is a
+        # deliberate spot worth mirroring new controls off of" from
+        # "this just happens to be occupying a default grid slot".
+        # Set by ControlList.move_control_from_canvas() and restored
+        # from the saved item in Controller.refresh().
+        self.manually_positioned = False
 
     def set_display_scale(self, scale):
         """Resize the hit area and display geometries dynamically.
@@ -92,12 +104,38 @@ class CircleControl(QWidget):
         self.set_display_scale(self.display_scale)
         self.update()
 
+    def set_bone_collection_visible(self, visible):
+        """Enables/disables this control to match whether its bone's
+        collection is currently visible in Blender - a hidden-collection
+        bone can't actually be selected in the viewport at all, so the
+        control shouldn't be clickable either (see Controller.
+        refresh_bone_collection_visibility_states(), which calls this
+        every poll tick). setEnabled(False) alone already blocks mouse
+        events; the cursor and paintEvent's dimming (see isEnabled()
+        check there) make that non-interactive state visible too.
+        """
+        if self.isEnabled() == visible:
+            return
+        self.setEnabled(visible)
+        self.setCursor(Qt.PointingHandCursor if visible else Qt.ArrowCursor)
+        self.update()
+
     # -----------------------------------------------------
 
+    @safe_override()
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+        # A control whose bone sits in a currently-hidden bone
+        # collection is setEnabled(False) (see Controller.
+        # refresh_bone_collection_visibility_states()) so it genuinely
+        # can't be clicked - dim the whole paint uniformly here so it
+        # also reads as non-interactive at a glance, rather than
+        # looking identical to every clickable control until clicked.
+        if not self.isEnabled():
+            painter.setOpacity(0.35)
 
         # Base padding reserved for strokes and hover scaling
         base_padding = max(3.0, 4.0 * self.display_scale)
@@ -197,11 +235,13 @@ class CircleControl(QWidget):
 
     # -----------------------------------------------------
 
+    @safe_override()
     def enterEvent(self, event):
         self.hover = True
         self.update()
         super().enterEvent(event)
 
+    @safe_override()
     def leaveEvent(self, event):
         self.hover = False
         self.update()
@@ -211,6 +251,7 @@ class CircleControl(QWidget):
     # is treated as a drag rather than a plain click-to-select.
     DRAG_THRESHOLD = 4
 
+    @safe_override()
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             # Don't snapshot or start dragging yet - a press could just be
@@ -228,6 +269,78 @@ class CircleControl(QWidget):
             return
         super().mousePressEvent(event)
 
+    def drag_to_global(self, global_pos, offset):
+        """Moves this control so the point `offset` (widget-local) sits
+        under `global_pos`, with the symmetry snap, canvas clamp and
+        collision rules a mouse drag uses. Shared by mouseMoveEvent()
+        and the canvas's G-key grab (PickerCanvas.begin_grab()).
+        """
+        parent = self.parent()
+        parent_pos = parent.mapFromGlobal(global_pos)
+
+        x = parent_pos.x() - offset.x()
+        y = parent_pos.y() - offset.y()
+
+        canvas = self.parent()
+
+        if canvas.symmetry_enabled and canvas.symmetry_x >= 0:
+            symmetry_canvas_x = canvas.image_x + canvas.symmetry_x * canvas.image_scale()
+            center = x + self.width() / 2
+
+            if abs(center - symmetry_canvas_x) < 8:
+                x = symmetry_canvas_x - self.width() / 2
+
+        # Clamp inside parent canvas. This has to come AFTER the symmetry
+        # snap: a symmetry line near (or past) the canvas edge snaps the
+        # control's center onto it, which can put part of the control
+        # outside the canvas. resolve_control_collision() below clamps
+        # again after each push for the same reason.
+        max_x = max(0, parent.width() - self.width())
+        max_y = max(0, parent.height() - self.height())
+        x = max(0, min(x, max_x))
+        y = max(0, min(y, max_y))
+
+        # round(), not the implicit truncation QPoint() does on a
+        # float: the symmetry-snap branch above can leave x as a
+        # float (symmetry_canvas_x - self.width()/2), and QPoint()
+        # truncates that toward zero instead of rounding. That
+        # truncation happens *before* the canvas position is ever
+        # converted to image space, so it doesn't just cost a
+        # sub-pixel of display rounding - it bakes up to a full
+        # pixel of left/up bias into the stored image_position and
+        # item["x"]/["y"] themselves. Everything downstream (resize/
+        # reshape's center-preserving math included) then faithfully
+        # preserves that already-biased position, which is why a
+        # resize after a symmetry snap looked like it drifted left.
+        x = round(x)
+        y = round(y)
+
+        # Don't let the drag land this control on top of another
+        # one - resolve_control_collision() slides x/y against
+        # whatever's in the way (or holds at the last non-colliding
+        # spot if fully blocked) before the position is ever
+        # persisted, so two controls' hit areas never overlap.
+        x, y = canvas._sweep_to(
+            (self.x(), self.y()), (x, y),
+            lambda cx, cy, hold: canvas.resolve_control_collision(self, cx, cy, hold),
+        )
+
+        # resolve_control_collision() only ever returns an in-bounds,
+        # non-overlapping spot, or the last accepted one when there is
+        # no such spot. If even that is outside the canvas (a control
+        # that was already out of bounds and is fully blocked), keep
+        # the control where it is rather than persisting it.
+        if not (0 <= x <= max_x and 0 <= y <= max_y):
+            return
+
+        # With symmetry on, the mirror partner moves too - don't let that
+        # put IT on top of a control or button either: hold still.
+        if canvas.mirror_collides(self, x, y):
+            return
+
+        parent.move_control_from_canvas(self, QPoint(x, y))
+
+    @safe_override()
     def mouseMoveEvent(self, event):
         if not self.dragging and self.drag_offset is not None:
             moved = event.position().toPoint() - self._press_pos
@@ -245,43 +358,13 @@ class CircleControl(QWidget):
             self.dragging = True
 
         if self.dragging:
-            parent = self.parent()
-            parent_pos = parent.mapFromGlobal(event.globalPosition().toPoint())
-
-            x = parent_pos.x() - self.drag_offset.x()
-            y = parent_pos.y() - self.drag_offset.y()
-
-            # Clamp inside parent canvas
-            x = max(0, min(x, parent.width() - self.width()))
-            y = max(0, min(y, parent.height() - self.height()))
-
-            canvas = self.parent()
-
-            if canvas.symmetry_enabled and canvas.symmetry_x >= 0:
-                symmetry_canvas_x = canvas.image_x + canvas.symmetry_x * canvas.image_scale()
-                center = x + self.width() / 2
-
-                if abs(center - symmetry_canvas_x) < 8:
-                    x = symmetry_canvas_x - self.width() / 2
-
-            # round(), not the implicit truncation QPoint() does on a
-            # float: the symmetry-snap branch above can leave x as a
-            # float (symmetry_canvas_x - self.width()/2), and QPoint()
-            # truncates that toward zero instead of rounding. That
-            # truncation happens *before* the canvas position is ever
-            # converted to image space, so it doesn't just cost a
-            # sub-pixel of display rounding - it bakes up to a full
-            # pixel of left/up bias into the stored image_position and
-            # item["x"]/["y"] themselves. Everything downstream (resize/
-            # reshape's center-preserving math included) then faithfully
-            # preserves that already-biased position, which is why a
-            # resize after a symmetry snap looked like it drifted left.
-            parent.move_control_from_canvas(self, QPoint(round(x), round(y)))
+            self.drag_to_global(event.globalPosition().toPoint(), self.drag_offset)
             event.accept()
             return
 
         super().mouseMoveEvent(event)
 
+    @safe_override()
     def mouseReleaseEvent(self, event):
         # A press on this control started here (drag_offset was set),
         # whether or not it ever crossed the drag threshold. Either way
@@ -294,6 +377,15 @@ class CircleControl(QWidget):
             was_drag = self.dragging
             self.dragging = False
             self.drag_offset = None
+
+            if was_drag:
+                # The one disk write for this whole drag - see
+                # ControlList.move_control_from_canvas()'s own comment
+                # for why it no longer saves on every mouseMoveEvent.
+                controller = getattr(self.window(), "controller", None)
+                if controller is not None:
+                    controller.save()
+
             shift = bool(event.modifiers() & Qt.ShiftModifier)
             self.clicked.emit(self.bone_name, shift, was_drag)
             event.accept()
