@@ -8,6 +8,13 @@ Rig Picker is a Blender add-on that lets you **select character rig controls thr
 
 Rig Picker is for character animators, rigging artists, and anyone working with character rigs in Blender who wants a cleaner viewport and an easier way to select controls.
 
+✨ Why Use Rig Picker?
+- 🎛️ Dedicated Picker Interface — Access rig controls through a custom UI.
+- 🎬 Animation-Focused Workflow — Reduce friction when working with character rigs.
+- ⌨️ Keyboard Shortcuts — Use supported hotkeys for quicker access to common actions.
+- 🧹 Less Viewport Clutter — Keep your Blender viewport cleaner by accessing rig controls through a dedicated picker interface.
+- 🧩 Blender-Native Experience — Looks and feels almost like Blender’s native interface.
+
 
 📸 **Effortless Image Capture** — Capture images for your visual picker with ease.
 🎯 **Precision Control Placement** — Position controls exactly where you want them on your rig images.
